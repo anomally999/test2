@@ -13,6 +13,7 @@ from contextlib import contextmanager
 import json
 from threading import Thread
 import flask
+import traceback
 
 # ---------- ENVIRONMENT ----------
 load_dotenv()
@@ -1291,7 +1292,7 @@ def get_active_giveaways(guild_id):
         print(f"Error getting active giveaways: {e}")
         return []
 
-# ---------- AUTHENTIC MEDIEVAL COMMANDS WITH ALL FEATURES ----------
+# ---------- AUTHENTIC MEDIEVAL PREFIX COMMANDS WITH ALL FEATURES ----------
 @bot.command(name="purse")
 @commands.guild_only()
 async def purse_cmd(ctx, member: discord.Member = None):
@@ -1645,7 +1646,7 @@ async def wager_cmd(ctx, amount: int, game: str = "dice"):
                 value=f"**{format_gold_amount(win_amount - amount)}** gold pieces!",
                 inline=True
             )
-            embed.set_image(url="https://media.giphy.com/media/3ohzdYrPBjW6cy2gla/giphy.gif   ")
+            embed.set_image(url="https://media.giphy.com/media/3ohzdYrPBjW6cy2gla/giphy.gif")
         else:
             embed = medieval_embed(
                 title=f"🎲 {game.title()} - Defeat",
@@ -2017,7 +2018,7 @@ async def treasures_cmd(ctx, member: discord.Member = None):
     except Exception as e:
         await ctx.send(embed=medieval_response(f"Zounds! The treasury records are amiss: {str(e)}", success=False))
 
-# ---------- MEDIEVAL GIVEAWAY COMMANDS ----------
+# ---------- MEDIEVAL GIVEAWAY PREFIX COMMANDS ----------
 @bot.command(name="setagrole")
 @commands.has_permissions(manage_roles=True)
 @commands.guild_only()
@@ -2383,6 +2384,347 @@ async def removeware_cmd(ctx, *, name: str):
     except Exception as e:
         await ctx.send(embed=medieval_response(f"Zounds! The removal failed: {str(e)}", success=False))
 
+# ---------- SLASH COMMANDS (/) - ALL FEATURES ----------
+@tree.command(name="purse", description="Inspect thy purse and treasury with wins/losses!")
+@app_commands.describe(member="Which subject to inspect (optional)")
+async def slash_purse(interaction: discord.Interaction, member: discord.Member = None):
+    """Slash command for purse inspection"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        # Create a mock context
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await purse_cmd(ctx, member)
+
+@tree.command(name="stipend", description="Claim thy daily royal stipend (3-7 gold)")
+async def slash_stipend(interaction: discord.Interaction):
+    """Slash command for daily stipend"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await stipend_cmd(ctx)
+
+@tree.command(name="labour", description="Perform honest labour for wages (8-15 gold, 1-hour cooldown)")
+async def slash_labour(interaction: discord.Interaction):
+    """Slash command for labour"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await labour_cmd(ctx)
+
+@tree.command(name="wager", description="Wager gold upon games of chance")
+@app_commands.describe(
+    amount="How much gold to wager",
+    game="Which game to play (dice/coin/slots)"
+)
+@app_commands.choices(game=[
+    app_commands.Choice(name="Dice (50% win)", value="dice"),
+    app_commands.Choice(name="Coin Flip (48% win)", value="coin"),
+    app_commands.Choice(name="Slots (up to 10x)", value="slots")
+])
+async def slash_wager(interaction: discord.Interaction, amount: int, game: str = "dice"):
+    """Slash command for gambling"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await wager_cmd(ctx, amount, game)
+
+@tree.command(name="pay", description="Pay gold to another subject")
+@app_commands.describe(
+    member="Who to pay",
+    amount="How much gold to transfer"
+)
+async def slash_pay(interaction: discord.Interaction, member: discord.Member, amount: int):
+    """Slash command for paying"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await pay_cmd(ctx, member, amount)
+
+@tree.command(name="chronicles", description="View economic chronicles with wins/losses")
+@app_commands.describe(member="Which subject to inspect (optional)")
+async def slash_chronicles(interaction: discord.Interaction, member: discord.Member = None):
+    """Slash command for chronicles"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await chronicles_cmd(ctx, member)
+
+@tree.command(name="nobles", description="View the realm's wealthiest nobles")
+async def slash_nobles(interaction: discord.Interaction):
+    """Slash command for nobles"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await nobles_cmd(ctx)
+
+@tree.command(name="wares", description="View Discord roles for purchase in the royal shop")
+async def slash_wares(interaction: discord.Interaction):
+    """Slash command for wares"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await wares_cmd(ctx)
+
+@tree.command(name="purchase", description="Purchase Discord role from the royal shop")
+@app_commands.describe(item_name="Name of the role to purchase")
+async def slash_purchase(interaction: discord.Interaction, item_name: str):
+    """Slash command for purchase"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await purchase_cmd(ctx, item_name=item_name)
+
+@tree.command(name="treasures", description="View thy purchased Discord roles")
+@app_commands.describe(member="Which subject to inspect (optional)")
+async def slash_treasures(interaction: discord.Interaction, member: discord.Member = None):
+    """Slash command for treasures"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await treasures_cmd(ctx, member)
+
+@tree.command(name="adminbounty", description="Claim thy monthly administrator's bounty (30 billion gold)")
+async def slash_adminbounty(interaction: discord.Interaction):
+    """Slash command for admin bounty"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await admin_bounty_cmd(ctx)
+
+@tree.command(name="datastatus", description="Show comprehensive data persistence status")
+async def slash_datastatus(interaction: discord.Interaction):
+    """Slash command for data status"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await data_status_cmd(ctx)
+
+@tree.command(name="charter", description="Display the complete royal charter of commands")
+async def slash_charter(interaction: discord.Interaction):
+    """Slash command for charter"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await charter_cmd(ctx)
+
+# ---------- SLASH ADMIN COMMANDS ----------
+@tree.command(name="setagrole", description="Set roles that can host tournaments (Admin)")
+@app_commands.describe(role="Role that can host tournaments")
+@app_commands.default_permissions(manage_roles=True)
+async def slash_setagrole(interaction: discord.Interaction, role: discord.Role):
+    """Slash command for setagrole"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await setagrole_cmd(ctx, role)
+
+@tree.command(name="removeagrole", description="Remove tournament host role (Admin)")
+@app_commands.describe(role="Role to remove from tournament hosts")
+@app_commands.default_permissions(manage_roles=True)
+async def slash_removeagrole(interaction: discord.Interaction, role: discord.Role):
+    """Slash command for removeagrole"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await removeagrole_cmd(ctx, role)
+
+@tree.command(name="tournament", description="Host a royal tournament with gold prizes")
+@app_commands.describe(
+    duration_minutes="How long the tournament lasts (5-1440 minutes)",
+    winner_count="How many winners (1-10)",
+    prize_amount="Gold prize for each winner",
+    prize_name="Name of the tournament prize"
+)
+async def slash_tournament(interaction: discord.Interaction, duration_minutes: int, winner_count: int, prize_amount: int, prize_name: str):
+    """Slash command for tournament"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await tournament_cmd(ctx, duration_minutes, winner_count, prize_amount, prize_name)
+
+@tree.command(name="tournaments", description="View active tournaments in the realm")
+async def slash_tournaments(interaction: discord.Interaction):
+    """Slash command for tournaments"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await tournaments_cmd(ctx)
+
+@tree.command(name="addware", description="Add Discord role to the royal shop (Admin)")
+@app_commands.describe(
+    name="Name of the ware",
+    role="Discord role to grant",
+    price="Price in gold pieces",
+    stock="Stock quantity (-1 for unlimited)",
+    description="Description of the ware"
+)
+@app_commands.default_permissions(manage_roles=True)
+async def slash_addware(interaction: discord.Interaction, name: str, role: discord.Role, price: int, stock: int = -1, description: str = "A fine Discord role from the royal shop"):
+    """Slash command for addware"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await addware_cmd(ctx, name, role, price, stock, description)
+
+@tree.command(name="removeware", description="Remove ware from the royal shop (Admin)")
+@app_commands.describe(name="Name of the ware to remove")
+@app_commands.default_permissions(manage_roles=True)
+async def slash_removeware(interaction: discord.Interaction, name: str):
+    """Slash command for removeware"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await removeware_cmd(ctx, name=name)
+
+@tree.command(name="backup", description="Create a complete backup of all data (Admin)")
+@app_commands.default_permissions(administrator=True)
+async def slash_backup(interaction: discord.Interaction):
+    """Slash command for backup"""
+    await interaction.response.defer()
+    ctx = await bot.get_context(interaction.message) if interaction.message else None
+    if not ctx:
+        class MockContext:
+            def __init__(self, interaction):
+                self.author = interaction.user
+                self.guild = interaction.guild
+                self.send = interaction.followup.send
+        ctx = MockContext(interaction)
+    
+    await backup_cmd(ctx)
+
 # ---------- REACTION HANDLER FOR TOURNAMENTS ----------
 @bot.event
 async def on_reaction_add(reaction, user):
@@ -2461,18 +2803,19 @@ async def charter_cmd(ctx):
 
         page1.add_field(
             name="💰 Essential Commands",
-            value=f"`{PREFIX}purse [@subject]` - Inspect thy purse and treasury\n"
-                  f"`{PREFIX}stipend` - Claim thy daily royal stipend (3-7 gold)\n"
-                  f"`{PREFIX}labour` - Perform honest labour for wages (8-15 gold)\n"
-                  f"`{PREFIX}pay @subject <amount>` - Pay gold to another subject",
+            value=f"**Prefix**: `{PREFIX}command` **Slash**: `/command`\n"
+                  f"`{PREFIX}purse` `/purse` - Inspect thy purse and treasury\n"
+                  f"`{PREFIX}stipend` `/stipend` - Claim thy daily royal stipend (3-7 gold)\n"
+                  f"`{PREFIX}labour` `/labour` - Perform honest labour for wages (8-15 gold)\n"
+                  f"`{PREFIX}pay` `/pay` - Pay gold to another subject",
             inline=False
         )
 
         page1.add_field(
             name="📊 Records & Statistics",
-            value=f"`{PREFIX}chronicles [@subject]` - View economic chronicles\n"
-                  f"`{PREFIX}nobles` - See the realm's wealthiest nobles\n"
-                  f"`{PREFIX}datastatus` - View comprehensive data persistence status",
+            value=f"`{PREFIX}chronicles` `/chronicles` - View economic chronicles\n"
+                  f"`{PREFIX}nobles` `/nobles` - See the realm's wealthiest nobles\n"
+                  f"`{PREFIX}datastatus` `/datastatus` - View comprehensive data persistence status",
             inline=False
         )
 
@@ -2483,7 +2826,8 @@ async def charter_cmd(ctx):
                   "• **Weekly Gambling**: 30 tries per week (resets Monday UTC)\n"
                   "• **NO Vault System**: All gold kept in purse for simplicity\n"
                   "• **Real Discord Roles**: Purchase actual Discord roles with gold\n"
-                  "• **Complete Data Persistence**: Everything saved to database",
+                  "• **Complete Data Persistence**: Everything saved to database\n"
+                  "• **Dual Command System**: Use both prefix (`!`) and slash (`/`) commands!",
             inline=False
         )
 
@@ -2498,7 +2842,7 @@ async def charter_cmd(ctx):
 
         page2.add_field(
             name="🎲 Games of Chance",
-            value=f"`{PREFIX}wager <amount> [dice|coin|slots]` - Wager gold upon games\n"
+            value=f"`{PREFIX}wager` `/wager` - Wager gold upon games\n"
                   f"• **Dice**: Cast the bones (50% to double)\n"
                   f"• **Coin**: Flip the royal coin (48% to double)\n"
                   f"• **Slots**: Turn the wheel of fortune (up to 10x payout)",
@@ -2511,7 +2855,8 @@ async def charter_cmd(ctx):
                   "• Wins and losses tracked in thy purse\n"
                   "• Dice offer fairest odds to brave souls\n"
                   "• Slots provide greatest rewards but rarest victories\n"
-                  "• Weekly counter resets every Monday at midnight UTC",
+                  "• Weekly counter resets every Monday at midnight UTC\n"
+                  "• Use either `!wager` or `/wager` to play!",
             inline=False
         )
 
@@ -2526,9 +2871,9 @@ async def charter_cmd(ctx):
 
         page3.add_field(
             name="🏪 Discord Role Commerce",
-            value=f"`{PREFIX}wares` - View His Majesty's Discord roles\n"
-                  f"`{PREFIX}purchase <role_name>` - Acquire Discord roles\n"
-                  f"`{PREFIX}treasures [@subject]` - View purchased Discord roles",
+            value=f"`{PREFIX}wares` `/wares` - View His Majesty's Discord roles\n"
+                  f"`{PREFIX}purchase` `/purchase` - Acquire Discord roles\n"
+                  f"`{PREFIX}treasures` `/treasures` - View purchased Discord roles",
             inline=False
         )
 
@@ -2536,7 +2881,8 @@ async def charter_cmd(ctx):
             name="⚔️ Labour System",
             value="• **1-Hour Personal Cooldown**: Each person hath their own schedule\n"
                   "• **Personal Timer**: No global cooldown - individual tracking\n"
-                  "• **Detailed Reminders**: Shows exact time until next work",
+                  "• **Detailed Reminders**: Shows exact time until next work\n"
+                  "• **Dual Commands**: `!labour` or `/labour` both work!",
             inline=False
         )
 
@@ -2545,7 +2891,8 @@ async def charter_cmd(ctx):
             value="• **Gold Caps**: Administrators have higher treasury limits\n"
                   "• **Admin Bounty**: Monthly 30 billion gold bonus for administrators\n"
                   "• **Wealth Limits**: Normal subjects capped at 50 billion gold\n"
-                  "• **Complete Persistence**: All data saved to database",
+                  "• **Complete Persistence**: All data saved to database\n"
+                  "• **Full Compatibility**: All commands work with both systems!",
             inline=False
         )
 
@@ -2560,17 +2907,17 @@ async def charter_cmd(ctx):
 
         page4.add_field(
             name="⚔️ Tournament Commands",
-            value=f"`{PREFIX}tournament <minutes> <winners> <amount> <name>` - Host a tournament\n"
-                  f"`{PREFIX}tournaments` - View active tournaments\n"
+            value=f"`{PREFIX}tournament` `/tournament` - Host a tournament\n"
+                  f"`{PREFIX}tournaments` `/tournaments` - View active tournaments\n"
                   "React with ⚔️ on tournament posts to enter!",
             inline=False
         )
 
         page4.add_field(
             name="👑 Tournament Management (Admin)",
-            value=f"`{PREFIX}setagrole @role` - Set who can host tournaments\n"
-                  f"`{PREFIX}removeagrole @role` - Remove tournament host role\n"
-                  f"`{PREFIX}backup` - Create complete data backup",
+            value=f"`{PREFIX}setagrole` `/setagrole` - Set who can host tournaments\n"
+                  f"`{PREFIX}removeagrole` `/removeagrole` - Remove tournament host role\n"
+                  f"`{PREFIX}backup` `/backup` - Create complete data backup",
             inline=False
         )
 
@@ -2580,7 +2927,8 @@ async def charter_cmd(ctx):
                   "• Tournaments require gold funding from the host\n"
                   "• Winners are chosen randomly from entrants\n"
                   "• React with ⚔️ to enter any tournament\n"
-                  "• All data persistently saved to database",
+                  "• All data persistently saved to database\n"
+                  "• Use either prefix or slash commands!",
             inline=False
         )
 
@@ -2595,16 +2943,17 @@ async def charter_cmd(ctx):
 
         page5.add_field(
             name="🏪 Discord Role Shop Management",
-            value=f"`{PREFIX}addware 'Role Name' @role <price> [stock] <desc>` - Add Discord role\n"
-                  f"`{PREFIX}removeware <name>` - Remove role from shop",
+            value=f"`{PREFIX}addware` `/addware` - Add Discord role\n"
+                  f"`{PREFIX}removeware` `/removeware` - Remove role from shop",
             inline=False
         )
 
         page5.add_field(
             name="👑 Administrator Privileges",
-            value=f"`{PREFIX}adminbounty` - Claim monthly 30 billion gold bonus\n"
+            value=f"`{PREFIX}adminbounty` `/adminbounty` - Claim monthly 30 billion gold bonus\n"
                   "• **Higher Gold Cap**: Administrators can hold 100 billion gold\n"
-                  "• **Monthly Bounty**: Exclusive 30 billion gold bonus every 30 days",
+                  "• **Monthly Bounty**: Exclusive 30 billion gold bonus every 30 days\n"
+                  "• **Dual Commands**: All admin commands work both ways!",
             inline=False
         )
 
@@ -2614,7 +2963,8 @@ async def charter_cmd(ctx):
                   "• Administrator Discord permissions for monthly bounty\n"
                   "• Cannot add roles above thine own station\n"
                   "• All transactions are logged by the crown\n"
-                  "• Complete data persistence ensures nothing is lost",
+                  "• Complete data persistence ensures nothing is lost\n"
+                  "• Full prefix and slash command support!",
             inline=False
         )
 
@@ -2633,7 +2983,8 @@ async def charter_cmd(ctx):
                   "• Work hourly for steady wages (8-15 gold)\n"
                   "• Administrators claim monthly 30 billion bonus\n"
                   "• Purchase Discord roles for prestige and status\n"
-                  "• All progress saved permanently to database",
+                  "• All progress saved permanently to database\n"
+                  "• Use `!` or `/` commands - thy choice!",
             inline=False
         )
 
@@ -2644,7 +2995,8 @@ async def charter_cmd(ctx):
                   "• Dice offer the fairest odds (50% win rate)\n"
                   "• Coin flips have slight house edge (48% win rate)\n"
                   "• Slots provide rare but great rewards (up to 10x)\n"
-                  "• All gambling data persistently tracked",
+                  "• All gambling data persistently tracked\n"
+                  "• Both `!wager` and `/wager` work perfectly!",
             inline=False
         )
 
@@ -2654,7 +3006,8 @@ async def charter_cmd(ctx):
                   "• **Wins/Losses Tracking**: Monitor thy gaming success in purse\n"
                   "• **Weekly Gambling Counter**: Know thy remaining tries\n"
                   "• **Real Discord Integration**: Purchase actual server roles\n"
-                  "• **Complete Data Persistence**: Never lose progress",
+                  "• **Complete Data Persistence**: Never lose progress\n"
+                  "• **Dual Command System**: Prefix (`!`) and Slash (`/`) both work!",
             inline=False
         )
 
@@ -2664,7 +3017,8 @@ async def charter_cmd(ctx):
                   "• **Royal Administrators**: Maximum 100 billion gold pieces\n"
                   "• All earnings are capped at these royal limits\n"
                   "• Monthly administrator bonus helps reach higher caps\n"
-                  "• All caps and balances persistently saved",
+                  "• All caps and balances persistently saved\n"
+                  "• Commands work identically with both systems!",
             inline=False
         )
 
@@ -2674,6 +3028,7 @@ async def charter_cmd(ctx):
                   "• Gold caps prevent inflation in His Majesty's realm\n"
                   "• Administrator privileges grant significant advantages\n"
                   "• Complete data persistence ensures nothing is ever lost\n"
+                  "• **DUAL COMMAND SYSTEM**: Prefix (`{PREFIX}`) AND Slash (`/`) commands work!\n"
                   "• May fortune favor thee in His Majesty's eternal realm!",
             inline=False
         )
@@ -2727,6 +3082,7 @@ async def on_ready():
         print('🎲 Weekly gambling tries system activated!')
         print('💾 MAXIMUM DATA PERSISTENCE ACTIVATED!')
         print('🎯 ULTIMATE MERGED VERSION READY!')
+        print('🔄 DUAL COMMAND SYSTEM: BOTH PREFIX AND SLASH COMMANDS WORK!')
 
         # Create initial backup
         backup_all_data()
@@ -2801,6 +3157,7 @@ if __name__ == "__main__":
         print("🎲 Weekly gambling tries system ready!")
         print("💾 MAXIMUM DATA PERSISTENCE ACHIEVED!")
         print("🎯 ALL SYSTEMS PERSISTENT - ULTIMATE MERGED VERSION!")
+        print("🔄 DUAL COMMAND SYSTEM: PREFIX AND SLASH COMMANDS BOTH WORK!")
 
         # Start Flask keep-alive server in background thread
         Thread(target=run_flask, daemon=True).start()
