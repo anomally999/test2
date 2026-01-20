@@ -1,6 +1,5 @@
 import os
 import random
-import sqlite3
 import discord
 from discord.ext import commands, tasks
 from discord import app_commands
@@ -9,17 +8,18 @@ from datetime import timedelta, datetime as dt, timezone
 from discord.utils import utcnow
 import asyncio
 import aiohttp
-from contextlib import contextmanager
 import json
 from threading import Thread
 import flask
 import traceback
+import asyncpg
+from contextlib import asynccontextmanager
 
 # ---------- ENVIRONMENT ----------
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 PREFIX = os.getenv("PREFIX", "!")
-DB_NAME = os.getenv("DB_PATH", "medieval_economy_ultimate.db")  # Configurable for Render persistent disk
+DATABASE_URL = os.getenv("DATABASE_URL")  # PostgreSQL connection string
 
 # ---------- ROYAL TREASURY IMAGES ----------
 TREASURY_SEAL_URL = "https://imgs.search.brave.com/ybyUdUFEw0dNXKCLGu2FuNAlJpvCTxkjXZUxOSFKcMM/rs:fit:500:0:1:0/g:ce/aHR0cHM6Ly90aHVt/YnMuZHJlYW1zdGlt/ZS5jb20vYi9yb3lh/bC1kZWNyZWUtdW52/ZWlsZWQtZXhxdWlz/aXRlLWdvbGQtc2Vh/bC12aW50YWdlLXN0/YXRpb25lcnktaGFu/ZHdyaXR0ZW4tbGV0/dGVyLWV4cGxvcmUt/b3B1bGVuY2UtcmVn/YWwtc3RlcC1iYWNr/LTM1MTI2NjUwOC5q/cGc"
@@ -35,55 +35,91 @@ ADMIN_MONTHLY_BONUS = 30000000000  # 30 billion gold monthly bonus for admins
 LABOUR_COOLDOWN_HOURS = 1  # 1 hour labour cooldown
 WEEKLY_GAMBLING_TRIES = 30  # 30 gambling attempts per week
 
-# ---------- DATABASE CONNECTION MANAGER ----------
-@contextmanager
-def get_db_connection():
-    """Context manager for database connections with enhanced persistence"""
+# ---------- DATABASE CONNECTION ----------
+connection_pool = None
+
+async def create_db_pool():
+    """Create PostgreSQL connection pool"""
+    global connection_pool
+    try:
+        connection_pool = await asyncpg.create_pool(
+            DATABASE_URL,
+            min_size=1,
+            max_size=10,
+            command_timeout=60
+        )
+        print("✅ PostgreSQL connection pool created successfully!")
+        return connection_pool
+    except Exception as e:
+        print(f"❌ Failed to create PostgreSQL pool: {e}")
+        return None
+
+@asynccontextmanager
+async def get_db_connection():
+    """Async context manager for PostgreSQL connections"""
+    if connection_pool is None:
+        await create_db_pool()
+    
     conn = None
     try:
-        conn = sqlite3.connect(DB_NAME, timeout=10.0, isolation_level=None)
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA synchronous=NORMAL")
-        conn.execute("PRAGMA cache_size=-10000")  # 10MB cache
-        conn.execute("PRAGMA temp_store=MEMORY")
-        conn.row_factory = sqlite3.Row
+        conn = await connection_pool.acquire()
         yield conn
-    except sqlite3.Error as e:
+    except Exception as e:
         print(f"Database error: {e}")
-        if conn:
-            conn.rollback()
         raise
     finally:
         if conn:
-            conn.close()
+            await connection_pool.release(conn)
+
+async def execute_query(query, *args):
+    """Execute a query with PostgreSQL"""
+    try:
+        async with get_db_connection() as conn:
+            return await conn.fetch(query, *args)
+    except Exception as e:
+        print(f"Query error: {e}")
+        return None
+
+async def execute_transaction(query, *args):
+    """Execute a transaction with PostgreSQL"""
+    try:
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                return await conn.execute(query, *args)
+    except Exception as e:
+        print(f"Transaction error: {e}")
+        return None
 
 # ---------- COMPREHENSIVE DATA PERSISTENCE ----------
-def save_config_to_db(key, value):
+async def save_config_to_db(key, value):
     """Save any configuration to database"""
     try:
-        with get_db_connection() as db:
+        async with get_db_connection() as conn:
             # Use JSON for complex data types
             if isinstance(value, (dict, list, set)):
                 value = json.dumps(value)
             elif isinstance(value, (discord.Role, discord.Member)):
                 value = str(value.id)
 
-            db.execute("""
-            INSERT OR REPLACE INTO persistent_config (config_key, config_value, updated_at)
-            VALUES (?, ?, ?)
-            """, (key, str(value), utcnow().isoformat()))
-            db.commit()
+            await conn.execute("""
+            INSERT INTO persistent_config (config_key, config_value, updated_at)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (config_key) DO UPDATE SET
+            config_value = EXCLUDED.config_value,
+            updated_at = EXCLUDED.updated_at
+            """, key, str(value), utcnow().isoformat())
+            
     except Exception as e:
         print(f"Error saving config {key}: {e}")
 
-def load_config_from_db(key, default=None, type_cast=str):
+async def load_config_from_db(key, default=None, type_cast=str):
     """Load configuration from database"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT config_value FROM persistent_config
-            WHERE config_key = ?
-            """, (key,)).fetchone()
+            WHERE config_key = $1
+            """, key)
 
             if row:
                 value = row['config_value']
@@ -100,65 +136,54 @@ def load_config_from_db(key, default=None, type_cast=str):
         print(f"Error loading config {key}: {e}")
         return default
 
-def save_giveaway_roles_to_db(guild_id, role_ids):
+async def save_giveaway_roles_to_db(guild_id, role_ids):
     """Save giveaway roles to database"""
-    save_config_to_db(f"giveaway_roles_{guild_id}", role_ids)
+    await save_config_to_db(f"giveaway_roles_{guild_id}", role_ids)
 
-def load_giveaway_roles_from_db(guild_id):
+async def load_giveaway_roles_from_db(guild_id):
     """Load giveaway roles from database"""
-    return load_config_from_db(f"giveaway_roles_{guild_id}", [], list)
+    return await load_config_from_db(f"giveaway_roles_{guild_id}", [], list)
 
-def backup_all_data():
+async def backup_all_data():
     """Create comprehensive backup of all data"""
     try:
-        backup_dir = "backups"
-        os.makedirs(backup_dir, exist_ok=True)
-
         timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
-        backup_file = f"{backup_dir}/medieval_backup_{timestamp}.db"
-
-        # Create backup
-        with get_db_connection() as db:
-            backup_db = sqlite3.connect(backup_file)
-            with backup_db:
-                db.backup(backup_db)
-            backup_db.close()
-
-        print(f"✅ Full database backup created: {backup_file}")
+        backup_file = f"medieval_backup_{timestamp}.sql"
+        
+        # Export data summary
+        summary = await export_data_summary()
+        
+        print(f"✅ Data backup created with summary")
         return backup_file
     except Exception as e:
         print(f"❌ Backup failed: {e}")
         return None
 
-def export_data_summary():
+async def export_data_summary():
     """Export summary of all data for verification"""
     try:
         summary = {}
 
-        with get_db_connection() as db:
+        async with get_db_connection() as conn:
             # Count all records
             tables = ['user_economy', 'shop_items', 'transactions', 'gambling_records',
-                     'active_giveaways', 'user_inventory', 'admin_monthly_claims']
+                     'active_giveaways', 'user_inventory', 'admin_monthly_claims', 'persistent_config']
 
             for table in tables:
-                count = db.execute(f"SELECT COUNT(*) as count FROM {table}").fetchone()['count']
-                summary[table] = count
-
-            # Get config count
-            config_count = db.execute("SELECT COUNT(*) as count FROM persistent_config").fetchone()['count']
-            summary['persistent_config'] = config_count
+                row = await conn.fetchrow(f"SELECT COUNT(*) as count FROM {table}")
+                summary[table] = row['count'] if row else 0
 
             # Get total gold in circulation
-            total_gold = db.execute("SELECT SUM(gold) as total FROM user_economy").fetchone()['total'] or 0
-            summary['total_gold_circulation'] = total_gold
+            row = await conn.fetchrow("SELECT SUM(gold) as total FROM user_economy")
+            summary['total_gold_circulation'] = row['total'] or 0
 
             # Get active users
-            active_users = db.execute("SELECT COUNT(DISTINCT user_id) as count FROM user_economy").fetchone()['count']
-            summary['active_users'] = active_users
+            row = await conn.fetchrow("SELECT COUNT(DISTINCT user_id) as count FROM user_economy")
+            summary['active_users'] = row['count'] if row else 0
 
         # Save summary
-        summary_file = "backups/data_summary.json"
         os.makedirs("backups", exist_ok=True)
+        summary_file = "backups/data_summary.json"
         with open(summary_file, 'w') as f:
             json.dump(summary, f, indent=2)
 
@@ -410,17 +435,17 @@ def get_week_start():
     week_start = now - timedelta(days=days_since_monday, hours=now.hour, minutes=now.minute, seconds=now.second, microseconds=now.microsecond)
     return week_start
 
-def can_gamble_weekly(user_id, guild_id):
+async def can_gamble_weekly(user_id, guild_id):
     """Check if user has gambling tries remaining this week"""
     try:
         week_start = get_week_start()
 
-        with get_db_connection() as db:
+        async with get_db_connection() as conn:
             # Count gambling attempts this week
-            row = db.execute("""
+            row = await conn.fetchrow("""
             SELECT COUNT(*) as count FROM gambling_records
-            WHERE user_id=? AND guild_id=? AND timestamp >= ?
-            """, (user_id, guild_id, week_start.isoformat())).fetchone()
+            WHERE user_id=$1 AND guild_id=$2 AND timestamp >= $3
+            """, user_id, guild_id, week_start.isoformat())
 
             current_tries = row['count'] if row else 0
             remaining = max(0, WEEKLY_GAMBLING_TRIES - current_tries)
@@ -439,204 +464,18 @@ intents.reactions = True
 bot = commands.Bot(command_prefix=PREFIX, intents=intents, help_command=None, case_insensitive=True)
 tree = bot.tree
 
-# ---------- COMPREHENSIVE DATABASE INITIALIZATION ----------
-def init_db():
-    """Initialize COMPREHENSIVE persistent database with ALL data"""
-    try:
-        with get_db_connection() as db:
-            print("🏰 Initializing COMPREHENSIVE PERSISTENT database...")
-
-            # Create persistent configuration table first
-            db.execute("""
-            CREATE TABLE IF NOT EXISTS persistent_config (
-                config_key TEXT PRIMARY KEY,
-                config_value TEXT,
-                updated_at TEXT,
-                created_at TEXT DEFAULT CURRENT_TIMESTAMP
-            )""")
-
-            # Create all other tables
-            tables_to_create = {
-                'user_economy': """
-                    CREATE TABLE IF NOT EXISTS user_economy (
-                        user_id INTEGER NOT NULL,
-                        guild_id INTEGER NOT NULL,
-                        gold INTEGER DEFAULT 100,
-                        daily_claimed TEXT,
-                        work_cooldown TEXT,
-                        gamble_wins INTEGER DEFAULT 0,
-                        gamble_losses INTEGER DEFAULT 0,
-                        total_gold_earned INTEGER DEFAULT 100,
-                        total_gold_spent INTEGER DEFAULT 0,
-                        noble_title TEXT DEFAULT 'Discord Citizen',
-                        is_admin BOOLEAN DEFAULT 0,
-                        admin_monthly_claimed TEXT,
-                        PRIMARY KEY (user_id, guild_id)
-                    )
-                """,
-
-                'transactions': """
-                    CREATE TABLE IF NOT EXISTS transactions (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        guild_id INTEGER,
-                        type TEXT,
-                        amount INTEGER,
-                        description TEXT,
-                        timestamp TEXT,
-                        balance_after INTEGER
-                    )
-                """,
-
-                'shop_items': """
-                    CREATE TABLE IF NOT EXISTS shop_items (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        guild_id INTEGER,
-                        name TEXT,
-                        description TEXT,
-                        price INTEGER,
-                        role_id INTEGER,
-                        role_name TEXT,
-                        role_color TEXT,
-                        role_position INTEGER,
-                        stock INTEGER DEFAULT -1,
-                        created_by INTEGER,
-                        created_at TEXT
-                    )
-                """,
-
-                'user_inventory': """
-                    CREATE TABLE IF NOT EXISTS user_inventory (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        guild_id INTEGER,
-                        item_id INTEGER,
-                        quantity INTEGER DEFAULT 1,
-                        purchased_at TEXT
-                    )
-                """,
-
-                'gambling_records': """
-                    CREATE TABLE IF NOT EXISTS gambling_records (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        guild_id INTEGER,
-                        game_type TEXT,
-                        bet_amount INTEGER,
-                        win_amount INTEGER,
-                        outcome TEXT,
-                        timestamp TEXT
-                    )
-                """,
-
-                'active_giveaways': """
-                    CREATE TABLE IF NOT EXISTS active_giveaways (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        guild_id INTEGER,
-                        channel_id INTEGER,
-                        message_id INTEGER,
-                        host_id INTEGER,
-                        prize_name TEXT,
-                        prize_amount INTEGER,
-                        end_time TEXT,
-                        winner_count INTEGER,
-                        requirements TEXT,
-                        status TEXT DEFAULT 'active'
-                    )
-                """,
-
-                'giveaway_entries': """
-                    CREATE TABLE IF NOT EXISTS giveaway_entries (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        giveaway_id INTEGER,
-                        user_id INTEGER,
-                        entered_at TEXT
-                    )
-                """,
-
-                'admin_monthly_claims': """
-                    CREATE TABLE IF NOT EXISTS admin_monthly_claims (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        user_id INTEGER,
-                        guild_id INTEGER,
-                        claim_month TEXT,
-                        claimed_at TEXT,
-                        amount INTEGER
-                    )
-                """,
-
-                'data_backups': """
-                    CREATE TABLE IF NOT EXISTS data_backups (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        backup_type TEXT,
-                        backup_data TEXT,
-                        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-                    )
-                """
-            }
-
-            # Create all tables
-            for table_name, create_sql in tables_to_create.items():
-                print(f"🗡️ Creating {table_name} table...")
-                db.execute(create_sql)
-
-            # Create indexes for better performance
-            indexes = [
-                "CREATE INDEX IF NOT EXISTS idx_user_economy_guild ON user_economy(guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_gambling_records_user ON gambling_records(user_id, guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_gambling_records_timestamp ON gambling_records(timestamp)",
-                "CREATE INDEX IF NOT EXISTS idx_shop_items_guild ON shop_items(guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_user_inventory_user ON user_inventory(user_id, guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_giveaway_entries_giveaway ON giveaway_entries(giveaway_id)",
-                "CREATE INDEX IF NOT EXISTS idx_active_giveaways_guild ON active_giveaways(guild_id)",
-                "CREATE INDEX IF NOT EXISTS idx_persistent_config_key ON persistent_config(config_key)"
-            ]
-
-            for index_sql in indexes:
-                db.execute(index_sql)
-
-            # Load saved configuration
-            load_all_saved_config()
-
-            db.commit()
-            print("✅ COMPREHENSIVE PERSISTENT Database created with ALL features!")
-
-    except sqlite3.Error as e:
-        print(f"❌ Database initialization error: {e}")
-        raise
-
-def load_all_saved_config():
-    """Load all saved configuration from database"""
-    try:
-        # Load giveaway roles
-        with get_db_connection() as db:
-            rows = db.execute("""
-            SELECT config_key, config_value FROM persistent_config
-            WHERE config_key LIKE 'giveaway_roles_%'
-            """).fetchall()
-
-            for row in rows:
-                guild_id = int(row['config_key'].replace('giveaway_roles_', ''))
-                role_ids = json.loads(row['config_value'])
-                GIVEAWAY_ROLES[guild_id] = role_ids
-
-        print(f"✅ Loaded {len(GIVEAWAY_ROLES)} guilds' giveaway roles from database")
-    except Exception as e:
-        print(f"❌ Error loading saved config: {e}")
-
 # ---------- GIVEAWAY ROLE STORAGE ----------
 GIVEAWAY_ROLES = {}  # guild_id: [role_id1, role_id2, ...]
 
 # ---------- ENHANCED MEDIEVAL ECONOMY FUNCTIONS ----------
-def is_user_admin(user_id, guild_id):
+async def is_user_admin(user_id, guild_id):
     """Check if user has admin privileges"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT is_admin FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if row and row['is_admin']:
                 return True
@@ -647,10 +486,9 @@ def is_user_admin(user_id, guild_id):
                 member = guild.get_member(user_id)
                 if member and member.guild_permissions.administrator:
                     # Update database to mark as admin
-                    db.execute("""
-                    UPDATE user_economy SET is_admin=1 WHERE user_id=? AND guild_id=?
-                    """, (user_id, guild_id))
-                    db.commit()
+                    await conn.execute("""
+                    UPDATE user_economy SET is_admin=true WHERE user_id=$1 AND guild_id=$2
+                    """, user_id, guild_id)
                     return True
 
             return False
@@ -658,41 +496,40 @@ def is_user_admin(user_id, guild_id):
         print(f"Error checking admin status: {e}")
         return False
 
-def get_user_balance(user_id, guild_id):
-    """Get user's gold and stats - NO VAULT"""
+async def get_user_balance(user_id, guild_id):
+    """Get user's gold and stats"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT gold, gamble_wins, gamble_losses, total_gold_earned, total_gold_spent, is_admin
             FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if row:
                 return row['gold'], row['gamble_wins'], row['gamble_losses'], row['total_gold_earned'], row['total_gold_spent'], row['is_admin']
             else:
                 # Create new user entry with starting gold
-                db.execute("""
+                await conn.execute("""
                 INSERT INTO user_economy (user_id, guild_id, gold, total_gold_earned)
-                VALUES (?, ?, 100, 100)
-                """, (user_id, guild_id))
-                db.commit()
+                VALUES ($1, $2, 100, 100)
+                """, user_id, guild_id)
                 return 100, 0, 0, 100, 0, False
     except Exception as e:
         print(f"Error getting user balance: {e}")
         return 0, 0, 0, 0, 0, False
 
-def get_gold_cap(user_id, guild_id):
+async def get_gold_cap(user_id, guild_id):
     """Get user's gold cap based on admin status"""
-    if is_user_admin(user_id, guild_id):
+    if await is_user_admin(user_id, guild_id):
         return MAX_GOLD_ADMIN
     return MAX_GOLD_NORMAL
 
-def update_user_balance(user_id, guild_id, gold_change, description=""):
-    """Update user balance - NO VAULT, ONLY GOLD"""
+async def update_user_balance(user_id, guild_id, gold_change, description=""):
+    """Update user balance"""
     try:
-        current_gold, wins, losses, total_earned, total_spent, is_admin = get_user_balance(user_id, guild_id)
-        gold_cap = get_gold_cap(user_id, guild_id)
+        current_gold, wins, losses, total_earned, total_spent, is_admin = await get_user_balance(user_id, guild_id)
+        gold_cap = await get_gold_cap(user_id, guild_id)
 
         # Calculate new gold with cap enforcement
         new_gold = max(0, current_gold + gold_change)
@@ -706,21 +543,20 @@ def update_user_balance(user_id, guild_id, gold_change, description=""):
             new_total_earned = total_earned
             new_total_spent = total_spent + abs(gold_change)
 
-        with get_db_connection() as db:
-            # Update balance
-            db.execute("""
-            UPDATE user_economy
-            SET gold=?, total_gold_earned=?, total_gold_spent=?
-            WHERE user_id=? AND guild_id=?
-            """, (new_gold, new_total_earned, new_total_spent, user_id, guild_id))
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                # Update balance
+                await conn.execute("""
+                UPDATE user_economy
+                SET gold=$1, total_gold_earned=$2, total_gold_spent=$3
+                WHERE user_id=$4 AND guild_id=$5
+                """, new_gold, new_total_earned, new_total_spent, user_id, guild_id)
 
-            # Record transaction
-            db.execute("""
-            INSERT INTO transactions (user_id, guild_id, type, amount, description, timestamp, balance_after)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (user_id, guild_id, "balance_change", gold_change, description, utcnow().isoformat(), new_gold))
-
-            db.commit()
+                # Record transaction
+                await conn.execute("""
+                INSERT INTO transactions (user_id, guild_id, type, amount, description, timestamp, balance_after)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, user_id, guild_id, "balance_change", gold_change, description, utcnow().isoformat(), new_gold)
 
         # Check if gold was capped
         actual_gold_change = new_gold - current_gold
@@ -732,19 +568,19 @@ def update_user_balance(user_id, guild_id, gold_change, description=""):
         print(f"Error updating user balance: {e}")
         return current_gold, False
 
-def can_claim_admin_monthly(user_id, guild_id):
+async def can_claim_admin_monthly(user_id, guild_id):
     """Check if admin can claim monthly bonus"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT admin_monthly_claimed FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if not row or not row['admin_monthly_claimed']:
                 return True
 
-            last_claimed = dt.fromisoformat(row['admin_monthly_claimed']).replace(tzinfo=timezone.utc)
+            last_claimed = row['admin_monthly_claimed'].replace(tzinfo=timezone.utc)
             time_since = utcnow() - last_claimed
 
             return time_since.total_seconds() >= 2592000  # 30 days
@@ -752,13 +588,13 @@ def can_claim_admin_monthly(user_id, guild_id):
         print(f"Error checking admin monthly claim: {e}")
         return True
 
-def claim_admin_monthly_bonus(user_id, guild_id):
+async def claim_admin_monthly_bonus(user_id, guild_id):
     """Claim monthly admin bonus (30 billion gold)"""
     try:
-        if not is_user_admin(user_id, guild_id):
+        if not await is_user_admin(user_id, guild_id):
             return False, 0, "Only royal administrators may claim this bounty!"
 
-        if not can_claim_admin_monthly(user_id, guild_id):
+        if not await can_claim_admin_monthly(user_id, guild_id):
             return False, 0, "Thou hast already received thy monthly administrator's bounty!"
 
         # Check if user has admin role in Discord
@@ -770,29 +606,33 @@ def claim_admin_monthly_bonus(user_id, guild_id):
         if not member or not member.guild_permissions.administrator:
             return False, 0, "Thou must have Administrator permissions to claim this bounty!"
 
-        with get_db_connection() as db:
-            # Update admin monthly claim
-            db.execute("""
-            UPDATE user_economy
-            SET gold=gold+?, admin_monthly_claimed=?
-            WHERE user_id=? AND guild_id=?
-            """, (ADMIN_MONTHLY_BONUS, utcnow().isoformat(), user_id, guild_id))
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                # Get current balance
+                current_gold = await conn.fetchval("""
+                SELECT gold FROM user_economy WHERE user_id=$1 AND guild_id=$2
+                """, user_id, guild_id) or 0
 
-            # Record transaction
-            db.execute("""
-            INSERT INTO transactions (user_id, guild_id, type, amount, description, timestamp, balance_after)
-            VALUES (?, ?, 'admin_monthly', ?, 'Royal administrator monthly bounty', ?, ?)
-            """, (user_id, guild_id, ADMIN_MONTHLY_BONUS, utcnow().isoformat(),
-                  get_user_balance(user_id, guild_id)[0] + ADMIN_MONTHLY_BONUS))
+                # Update admin monthly claim
+                await conn.execute("""
+                UPDATE user_economy
+                SET gold=gold+$1, admin_monthly_claimed=$2
+                WHERE user_id=$3 AND guild_id=$4
+                """, ADMIN_MONTHLY_BONUS, utcnow().isoformat(), user_id, guild_id)
 
-            # Record in admin claims table
-            current_month = dt.now().strftime("%Y-%m")
-            db.execute("""
-            INSERT INTO admin_monthly_claims (user_id, guild_id, claim_month, claimed_at, amount)
-            VALUES (?, ?, ?, ?, ?)
-            """, (user_id, guild_id, current_month, utcnow().isoformat(), ADMIN_MONTHLY_BONUS))
+                # Record transaction
+                await conn.execute("""
+                INSERT INTO transactions (user_id, guild_id, type, amount, description, timestamp, balance_after)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, user_id, guild_id, 'admin_monthly', ADMIN_MONTHLY_BONUS, 
+                     'Royal administrator monthly bounty', utcnow().isoformat(), current_gold + ADMIN_MONTHLY_BONUS)
 
-            db.commit()
+                # Record in admin claims table
+                current_month = dt.now().strftime("%Y-%m")
+                await conn.execute("""
+                INSERT INTO admin_monthly_claims (user_id, guild_id, claim_month, claimed_at, amount)
+                VALUES ($1, $2, $3, $4, $5)
+                """, user_id, guild_id, current_month, utcnow().isoformat(), ADMIN_MONTHLY_BONUS)
 
         return True, ADMIN_MONTHLY_BONUS, ""
 
@@ -800,19 +640,19 @@ def claim_admin_monthly_bonus(user_id, guild_id):
         print(f"Error claiming admin monthly bonus: {e}")
         return False, 0, "An error befell the royal treasury!"
 
-def can_claim_daily(user_id, guild_id):
+async def can_claim_daily(user_id, guild_id):
     """Check if user can claim daily gold"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT daily_claimed FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if not row or not row['daily_claimed']:
                 return True
 
-            last_claimed = dt.fromisoformat(row['daily_claimed']).replace(tzinfo=timezone.utc)
+            last_claimed = row['daily_claimed'].replace(tzinfo=timezone.utc)
             time_since = utcnow() - last_claimed
 
             return time_since.total_seconds() >= 86400  # 24 hours
@@ -820,14 +660,14 @@ def can_claim_daily(user_id, guild_id):
         print(f"Error checking daily claim: {e}")
         return True
 
-def claim_daily(user_id, guild_id):
+async def claim_daily(user_id, guild_id):
     """Claim daily royal stipend (3-7 gold)"""
     try:
-        if not can_claim_daily(user_id, guild_id):
+        if not await can_claim_daily(user_id, guild_id):
             return False, 0
 
         daily_amount = random.randint(3, 7)
-        new_gold, capped = update_user_balance(user_id, guild_id, daily_amount, "Royal daily stipend")
+        new_gold, capped = await update_user_balance(user_id, guild_id, daily_amount, "Royal daily stipend")
 
         if capped:
             return True, daily_amount  # Still successful even if capped
@@ -836,22 +676,22 @@ def claim_daily(user_id, guild_id):
         print(f"Error claiming daily: {e}")
         return False, 0
 
-def get_labour_cooldown_status(user_id, guild_id):
+async def get_labour_cooldown_status(user_id, guild_id):
     """Check labour cooldown status with detailed info"""
     try:
         current_time = utcnow()
 
         # Check database cooldown
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT work_cooldown FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if not row or not row['work_cooldown']:
                 return True, 0, "Ready to work"
 
-            last_work = dt.fromisoformat(row['work_cooldown']).replace(tzinfo=timezone.utc)
+            last_work = row['work_cooldown'].replace(tzinfo=timezone.utc)
             time_since = current_time - last_work
             cooldown_seconds = LABOUR_COOLDOWN_HOURS * 3600
 
@@ -864,25 +704,24 @@ def get_labour_cooldown_status(user_id, guild_id):
         print(f"Error checking labour cooldown: {e}")
         return True, 0, "Ready to work"
 
-def work(user_id, guild_id):
+async def work(user_id, guild_id):
     """Work for honest wages (8-15 gold) with 1-hour individual cooldown"""
     try:
-        can_work, remaining_time, status_msg = get_labour_cooldown_status(user_id, guild_id)
+        can_work, remaining_time, status_msg = await get_labour_cooldown_status(user_id, guild_id)
 
         if not can_work:
             return False, 0, remaining_time
 
         work_amount = random.randint(8, 15)
-        new_gold, capped = update_user_balance(user_id, guild_id, work_amount, "Honest labour in the royal demesne")
+        new_gold, capped = await update_user_balance(user_id, guild_id, work_amount, "Honest labour in the royal demesne")
 
         # Update work cooldown in database
-        with get_db_connection() as db:
-            db.execute("""
+        async with get_db_connection() as conn:
+            await conn.execute("""
             UPDATE user_economy
-            SET work_cooldown=?
-            WHERE user_id=? AND guild_id=?
-            """, (utcnow().isoformat(), user_id, guild_id))
-            db.commit()
+            SET work_cooldown=$1
+            WHERE user_id=$2 AND guild_id=$3
+            """, utcnow().isoformat(), user_id, guild_id)
 
         if capped:
             return True, work_amount, 0  # Still successful even if capped, no remaining time
@@ -892,17 +731,17 @@ def work(user_id, guild_id):
         print(f"Error working: {e}")
         return False, 0, 0
 
-def gamble(user_id, guild_id, amount, game_type="dice"):
+async def gamble(user_id, guild_id, amount, game_type="dice"):
     """Gamble gold with medieval games - NOW WITH WEEKLY LIMITS!"""
     try:
         # Check weekly gambling tries first
-        can_gamble, remaining_tries, used_tries = can_gamble_weekly(user_id, guild_id)
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(user_id, guild_id)
 
         if not can_gamble:
             return False, 0, f"Thou hast exhausted thy weekly gambling allowance! Thou hast used all {WEEKLY_GAMBLING_TRIES} tries this week."
 
-        current_gold, wins, losses, total_earned, total_spent, is_admin = get_user_balance(user_id, guild_id)
-        gold_cap = get_gold_cap(user_id, guild_id)
+        current_gold, wins, losses, total_earned, total_spent, is_admin = await get_user_balance(user_id, guild_id)
+        gold_cap = await get_gold_cap(user_id, guild_id)
 
         if amount <= 0:
             return False, 0, "Thou must wager a positive sum, good master!"
@@ -945,28 +784,27 @@ def gamble(user_id, guild_id, amount, game_type="dice"):
         net_change = win_amount - amount
 
         # Update balance with cap check
-        new_gold, capped = update_user_balance(user_id, guild_id, net_change, f"Gamed {amount} on {game_type} - {'Won' if win else 'Lost'}")
+        new_gold, capped = await update_user_balance(user_id, guild_id, net_change, f"Gamed {amount} on {game_type} - {'Won' if win else 'Lost'}")
 
         # Update gambling stats
-        with get_db_connection() as db:
-            if win:
-                db.execute("""
-                UPDATE user_economy SET gamble_wins=gamble_wins+1
-                WHERE user_id=? AND guild_id=?
-                """, (user_id, guild_id))
-            else:
-                db.execute("""
-                UPDATE user_economy SET gamble_losses=gamble_losses+1
-                WHERE user_id=? AND guild_id=?
-                """, (user_id, guild_id))
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                if win:
+                    await conn.execute("""
+                    UPDATE user_economy SET gamble_wins=gamble_wins+1
+                    WHERE user_id=$1 AND guild_id=$2
+                    """, user_id, guild_id)
+                else:
+                    await conn.execute("""
+                    UPDATE user_economy SET gamble_losses=gamble_losses+1
+                    WHERE user_id=$1 AND guild_id=$2
+                    """, user_id, guild_id)
 
-            # Record gambling
-            db.execute("""
-            INSERT INTO gambling_records (user_id, guild_id, game_type, bet_amount, win_amount, outcome, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (user_id, guild_id, game_type, amount, win_amount, "win" if win else "loss", utcnow().isoformat()))
-
-            db.commit()
+                # Record gambling
+                await conn.execute("""
+                INSERT INTO gambling_records (user_id, guild_id, game_type, bet_amount, win_amount, outcome, timestamp)
+                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                """, user_id, guild_id, game_type, amount, win_amount, "win" if win else "loss", utcnow().isoformat())
 
         if capped and win:
             return win, win_amount, f"Thy winnings were capped at {format_gold_amount(new_gold)} gold pieces!"
@@ -981,12 +819,12 @@ def gamble(user_id, guild_id, amount, game_type="dice"):
         print(f"Error gambling: {e}")
         return False, 0, "An ill omen befell thy game!"
 
-def transfer_gold(sender_id, receiver_id, guild_id, amount):
+async def transfer_gold(sender_id, receiver_id, guild_id, amount):
     """Transfer gold between subjects"""
     try:
-        sender_gold, _, _, _, _, _ = get_user_balance(sender_id, guild_id)
-        receiver_gold, _, _, _, _, receiver_is_admin = get_user_balance(receiver_id, guild_id)
-        receiver_cap = get_gold_cap(receiver_id, guild_id)
+        sender_gold, _, _, _, _, _ = await get_user_balance(sender_id, guild_id)
+        receiver_gold, _, _, _, _, receiver_is_admin = await get_user_balance(receiver_id, guild_id)
+        receiver_cap = await get_gold_cap(receiver_id, guild_id)
 
         if amount <= 0:
             return False, "Thy sum must be positive, good master!"
@@ -1002,23 +840,23 @@ def transfer_gold(sender_id, receiver_id, guild_id, amount):
             return False, f"The recipient's purse cannot hold more than {format_gold_amount(receiver_cap)} gold pieces!"
 
         # Perform transfer
-        update_user_balance(sender_id, guild_id, -amount, f"Paid {amount} gold to subject {receiver_id}")
-        update_user_balance(receiver_id, guild_id, amount, f"Received {amount} gold from subject {sender_id}")
+        await update_user_balance(sender_id, guild_id, -amount, f"Paid {amount} gold to subject {receiver_id}")
+        await update_user_balance(receiver_id, guild_id, amount, f"Received {amount} gold from subject {sender_id}")
 
         return True, ""
     except Exception as e:
         print(f"Error transferring gold: {e}")
         return False, "The transfer failed most grievously!"
 
-def get_economy_stats(user_id, guild_id):
-    """Get comprehensive economy chronicles - NO VAULT"""
+async def get_economy_stats(user_id, guild_id):
+    """Get comprehensive economy chronicles"""
     try:
-        with get_db_connection() as db:
-            row = db.execute("""
+        async with get_db_connection() as conn:
+            row = await conn.fetchrow("""
             SELECT gold, gamble_wins, gamble_losses, total_gold_earned, total_gold_spent, is_admin
             FROM user_economy
-            WHERE user_id=? AND guild_id=?
-            """, (user_id, guild_id)).fetchone()
+            WHERE user_id=$1 AND guild_id=$2
+            """, user_id, guild_id)
 
             if row:
                 return dict(row)
@@ -1027,17 +865,17 @@ def get_economy_stats(user_id, guild_id):
         print(f"Error getting economy stats: {e}")
         return None
 
-def get_leaderboard(guild_id, limit=10):
-    """Get the realm's wealthiest nobles - NO VAULT"""
+async def get_leaderboard(guild_id, limit=10):
+    """Get the realm's wealthiest nobles"""
     try:
-        with get_db_connection() as db:
-            rows = db.execute("""
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
             SELECT user_id, gold, gamble_wins, gamble_losses, total_gold_earned, total_gold_spent, is_admin
             FROM user_economy
-            WHERE guild_id=?
+            WHERE guild_id=$1
             ORDER BY gold DESC
-            LIMIT ?
-            """, (guild_id, limit)).fetchall()
+            LIMIT $2
+            """, guild_id, limit)
 
             return rows
     except Exception as e:
@@ -1045,36 +883,35 @@ def get_leaderboard(guild_id, limit=10):
         return []
 
 # ---------- REAL ROLE-BASED SHOP SYSTEM ----------
-def add_shop_item(guild_id, name, description, price, role=None, stock=-1, created_by=None):
+async def add_shop_item(guild_id, name, description, price, role=None, stock=-1, created_by=None):
     """Add Discord role to the royal shop"""
     try:
-        with get_db_connection() as db:
+        async with get_db_connection() as conn:
             role_id = role.id if role else None
             role_name = role.name if role else None
             role_color = str(role.color) if role else None
             role_position = role.position if role else 0
 
-            db.execute("""
+            await conn.execute("""
             INSERT INTO shop_items (guild_id, name, description, price, role_id, role_name, role_color, role_position, stock, created_by, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (guild_id, name, description, price, role_id, role_name, role_color, role_position, stock, created_by, utcnow().isoformat()))
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+            """, guild_id, name, description, price, role_id, role_name, role_color, role_position, stock, created_by, utcnow().isoformat())
 
-            db.commit()
             return True
     except Exception as e:
         print(f"Error adding shop item: {e}")
         return False
 
-def get_shop_items(guild_id):
+async def get_shop_items(guild_id):
     """Get all items from the royal shop"""
     try:
-        with get_db_connection() as db:
-            rows = db.execute("""
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
             SELECT id, name, description, price, role_id, role_name, role_color, role_position, stock
             FROM shop_items
-            WHERE guild_id=?
+            WHERE guild_id=$1
             ORDER BY role_position DESC, price ASC
-            """, (guild_id,)).fetchall()
+            """, guild_id)
 
             return rows
     except Exception as e:
@@ -1084,82 +921,79 @@ def get_shop_items(guild_id):
 async def buy_item(user_id, guild_id, item_id, guild):
     """Purchase Discord role from royal shop"""
     try:
-        with get_db_connection() as db:
-            # Get item details
-            item = db.execute("""
-            SELECT * FROM shop_items
-            WHERE id=? AND guild_id=?
-            """, (item_id, guild_id)).fetchone()
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                # Get item details
+                item = await conn.fetchrow("""
+                SELECT * FROM shop_items
+                WHERE id=$1 AND guild_id=$2
+                """, item_id, guild_id)
 
-            if not item:
-                return False, "Such merchandise exists not in our realm!", None
+                if not item:
+                    return False, "Such merchandise exists not in our realm!", None
 
-            if item['stock'] == 0:
-                return False, "This treasure is sold out, good master!", None
+                if item['stock'] == 0:
+                    return False, "This treasure is sold out, good master!", None
 
-            user_gold, _, _, _, _, is_admin = get_user_balance(user_id, guild_id)
-            gold_cap = get_gold_cap(user_id, guild_id)
+                user_gold, _, _, _, _, is_admin = await get_user_balance(user_id, guild_id)
+                gold_cap = await get_gold_cap(user_id, guild_id)
 
-            if user_gold < item['price']:
-                return False, "Thy purse lacks sufficient coin for this purchase!", None
+                if user_gold < item['price']:
+                    return False, "Thy purse lacks sufficient coin for this purchase!", None
 
-            # Check if purchase would exceed gold cap
-            if user_gold - item['price'] > gold_cap:
-                return False, f"Thy gold cannot exceed {format_gold_amount(gold_cap)} gold pieces!", None
+                # Check if purchase would exceed gold cap
+                if user_gold - item['price'] > gold_cap:
+                    return False, f"Thy gold cannot exceed {format_gold_amount(gold_cap)} gold pieces!", None
 
-            # Check if user already has this role
-            member = guild.get_member(user_id)
-            if member and item['role_id']:
-                existing_role = guild.get_role(item['role_id'])
-                if existing_role and existing_role in member.roles:
-                    return False, f"Thou already possess the {existing_role.mention} station!", None
+                # Check if user already has this role
+                member = guild.get_member(user_id)
+                if member and item['role_id']:
+                    existing_role = guild.get_role(item['role_id'])
+                    if existing_role and existing_role in member.roles:
+                        return False, f"Thou already possess the {existing_role.mention} station!", None
 
-            # Deduct gold
-            new_gold, capped = update_user_balance(user_id, guild_id, -item['price'], f"Purchased {item['name']} from royal shop")
+                # Deduct gold
+                new_gold, capped = await update_user_balance(user_id, guild_id, -item['price'], f"Purchased {item['name']} from royal shop")
 
-            # Add to inventory
-            db.execute("""
-            INSERT INTO user_inventory (user_id, guild_id, item_id, purchased_at)
-            VALUES (?, ?, ?, ?)
-            """, (user_id, guild_id, item_id, utcnow().isoformat()))
+                # Add to inventory
+                await conn.execute("""
+                INSERT INTO user_inventory (user_id, guild_id, item_id, purchased_at)
+                VALUES ($1, $2, $3, $4)
+                """, user_id, guild_id, item_id, utcnow().isoformat())
 
-            # Update stock if limited
-            if item['stock'] > 0:
-                db.execute("""
-                UPDATE shop_items SET stock=stock-1 WHERE id=?
-                """, (item_id,))
+                # Update stock if limited
+                if item['stock'] > 0:
+                    await conn.execute("""
+                    UPDATE shop_items SET stock=stock-1 WHERE id=$1
+                    """, item_id)
 
-            db.commit()
+                # Handle role assignment if item has a role
+                if item['role_id']:
+                    if member:
+                        role = guild.get_role(item['role_id'])
+                        if role:
+                            try:
+                                await member.add_roles(role)
+                                return True, item['name'], role.mention
+                            except (discord.Forbidden, discord.HTTPException):
+                                return True, item['name'], None
 
-            # Handle role assignment if item has a role
-            if item['role_id']:
-                if member:
-                    role = guild.get_role(item['role_id'])
-                    if role:
-                        try:
-                            await member.add_roles(role)
-                            return True, item['name'], role.mention
-                        except discord.Forbidden:
-                            return True, item['name'], None
-                        except discord.HTTPException:
-                            return True, item['name'], None
-
-            return True, item['name'], None
+                return True, item['name'], None
     except Exception as e:
         print(f"Error buying item: {e}")
         return False, "The purchase failed most grievously!", None
 
-def get_user_inventory(user_id, guild_id):
+async def get_user_inventory(user_id, guild_id):
     """Get user's purchased Discord roles"""
     try:
-        with get_db_connection() as db:
-            rows = db.execute("""
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
             SELECT si.name, si.description, si.price, si.role_name, si.role_color, si.role_position, ui.purchased_at
             FROM user_inventory ui
             JOIN shop_items si ON ui.item_id = si.id
-            WHERE ui.user_id=? AND ui.guild_id=?
+            WHERE ui.user_id=$1 AND ui.guild_id=$2
             ORDER BY ui.purchased_at DESC
-            """, (user_id, guild_id)).fetchall()
+            """, user_id, guild_id)
 
             return rows
     except Exception as e:
@@ -1167,10 +1001,10 @@ def get_user_inventory(user_id, guild_id):
         return []
 
 # ---------- MEDIEVAL GIVEAWAY SYSTEM ----------
-def has_giveaway_permission(member, guild_id):
+async def has_giveaway_permission(member, guild_id):
     """Check if member has giveaway host permission"""
     try:
-        guild_roles = load_giveaway_roles_from_db(guild_id)
+        guild_roles = await load_giveaway_roles_from_db(guild_id)
         if not guild_roles:
             return False
 
@@ -1180,132 +1014,129 @@ def has_giveaway_permission(member, guild_id):
         print(f"Error checking giveaway permission: {e}")
         return False
 
-def create_giveaway(guild_id, channel_id, message_id, host_id, prize_name, prize_amount, end_time, winner_count=1, requirements=None):
+async def create_giveaway(guild_id, channel_id, message_id, host_id, prize_name, prize_amount, end_time, winner_count=1, requirements=None):
     """Create a new tournament/giveaway"""
     try:
-        with get_db_connection() as db:
-            db.execute("""
+        async with get_db_connection() as conn:
+            await conn.execute("""
             INSERT INTO active_giveaways (guild_id, channel_id, message_id, host_id, prize_name, prize_amount, end_time, winner_count, requirements)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (guild_id, channel_id, message_id, host_id, prize_name, prize_amount, end_time.isoformat(), winner_count, json.dumps(requirements) if requirements else None))
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+            """, guild_id, channel_id, message_id, host_id, prize_name, prize_amount, end_time.isoformat(), winner_count, json.dumps(requirements) if requirements else None)
 
-            db.commit()
             return True
     except Exception as e:
         print(f"Error creating giveaway: {e}")
         return False
 
-def enter_giveaway(giveaway_id, user_id):
+async def enter_giveaway(giveaway_id, user_id):
     """Enter a user into a tournament"""
     try:
-        with get_db_connection() as db:
+        async with get_db_connection() as conn:
             # Check if already entered
-            existing = db.execute("""
+            existing = await conn.fetchrow("""
             SELECT id FROM giveaway_entries
-            WHERE giveaway_id=? AND user_id=?
-            """, (giveaway_id, user_id)).fetchone()
+            WHERE giveaway_id=$1 AND user_id=$2
+            """, giveaway_id, user_id)
 
             if existing:
                 return False, "Already entered"
 
-            db.execute("""
+            await conn.execute("""
             INSERT INTO giveaway_entries (giveaway_id, user_id, entered_at)
-            VALUES (?, ?, ?)
-            """, (giveaway_id, user_id, utcnow().isoformat()))
+            VALUES ($1, $2, $3)
+            """, giveaway_id, user_id, utcnow().isoformat())
 
-            db.commit()
             return True, "Entered successfully"
     except Exception as e:
         print(f"Error entering giveaway: {e}")
         return False, "Entry failed"
 
-def get_giveaway_entries(giveaway_id):
+async def get_giveaway_entries(giveaway_id):
     """Get all entries for a giveaway"""
     try:
-        with get_db_connection() as db:
-            rows = db.execute("""
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
             SELECT user_id FROM giveaway_entries
-            WHERE giveaway_id=?
-            """, (giveaway_id,)).fetchall()
+            WHERE giveaway_id=$1
+            """, giveaway_id)
 
             return [row['user_id'] for row in rows]
     except Exception as e:
         print(f"Error getting giveaway entries: {e}")
         return []
 
-def end_giveaway(giveaway_id):
+async def end_giveaway(giveaway_id):
     """End a giveaway and select winners"""
     try:
-        with get_db_connection() as db:
-            # Get giveaway info
-            giveaway = db.execute("""
-            SELECT * FROM active_giveaways
-            WHERE id=? AND status='active'
-            """, (giveaway_id,)).fetchone()
+        async with get_db_connection() as conn:
+            async with conn.transaction():
+                # Get giveaway info
+                giveaway = await conn.fetchrow("""
+                SELECT * FROM active_giveaways
+                WHERE id=$1 AND status='active'
+                """, giveaway_id)
 
-            if not giveaway:
-                return None, None
+                if not giveaway:
+                    return None, None
 
-            # Get all entries
-            entries = get_giveaway_entries(giveaway_id)
+                # Get all entries
+                entries = await get_giveaway_entries(giveaway_id)
 
-            if not entries:
-                # Mark as ended with no winners
-                db.execute("""
-                UPDATE active_giveaways SET status='ended' WHERE id=?
-                """, (giveaway_id,))
-                db.commit()
-                return [], giveaway
+                if not entries:
+                    # Mark as ended with no winners
+                    await conn.execute("""
+                    UPDATE active_giveaways SET status='ended' WHERE id=$1
+                    """, giveaway_id)
+                    return [], giveaway
 
-            # Select random winners
-            winner_count = min(giveaway['winner_count'], len(entries))
-            winners = random.sample(entries, winner_count)
+                # Select random winners
+                winner_count = min(giveaway['winner_count'], len(entries))
+                winners = random.sample(entries, winner_count)
 
-            # Mark giveaway as ended
-            db.execute("""
-            UPDATE active_giveaways SET status='ended' WHERE id=?
-            """, (giveaway_id,))
+                # Mark giveaway as ended
+                await conn.execute("""
+                UPDATE active_giveaways SET status='ended' WHERE id=$1
+                """, giveaway_id)
 
-            # Award prizes to winners
-            for winner_id in winners:
-                update_user_balance(winner_id, giveaway['guild_id'], giveaway['prize_amount'], f"Won tournament: {giveaway['prize_name']}")
+                # Award prizes to winners
+                for winner_id in winners:
+                    await update_user_balance(winner_id, giveaway['guild_id'], giveaway['prize_amount'], f"Won tournament: {giveaway['prize_name']}")
 
-            db.commit()
-            return winners, giveaway
+                return winners, giveaway
 
     except Exception as e:
         print(f"Error ending giveaway: {e}")
         return None, None
 
-def get_active_giveaways(guild_id):
+async def get_active_giveaways(guild_id):
     """Get all active giveaways for a guild"""
     try:
-        with get_db_connection() as db:
-            rows = db.execute("""
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
             SELECT * FROM active_giveaways
-            WHERE guild_id=? AND status='active' AND datetime(end_time) > datetime('now')
+            WHERE guild_id=$1 AND status='active' AND end_time > NOW()
             ORDER BY end_time ASC
-            """, (guild_id,)).fetchall()
+            """, guild_id)
 
             return rows
     except Exception as e:
         print(f"Error getting active giveaways: {e}")
         return []
 
-# ---------- AUTHENTIC MEDIEVAL PREFIX COMMANDS WITH ALL FEATURES ----------
+# ---------- AUTHENTIC MEDIEVAL PREFIX COMMANDS ----------
 @bot.command(name="purse")
 @commands.guild_only()
 async def purse_cmd(ctx, member: discord.Member = None):
-    """Inspect thy purse and treasury - ULTIMATE with wins/losses & role hierarchy!"""
+    """Inspect thy purse and treasury"""
     try:
         member = member or ctx.author
-        gold, wins, losses, total_earned, total_spent, is_admin = get_user_balance(member.id, ctx.guild.id)
+        gold, wins, losses, total_earned, total_spent, is_admin = await get_user_balance(member.id, ctx.guild.id)
 
         # Get real Discord role information
         medieval_title, hierarchy_text, highest_role = get_user_role_info(member)
 
         # Get weekly gambling status
-        can_gamble, remaining_tries, used_tries = can_gamble_weekly(member.id, ctx.guild.id)
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(member.id, ctx.guild.id)
 
         embed = medieval_embed(
             title=f"💰 Royal Purse of {member.display_name}",
@@ -1366,14 +1197,7 @@ async def purse_cmd(ctx, member: discord.Member = None):
         cap_type = "Administrator" if is_admin else "Subject"
         embed.add_field(
             name="🏰 Royal Treasury Limit",
-            value=f"**{cap_type} Cap**: {format_gold_amount(get_gold_cap(member.id, ctx.guild.id))} gold pieces",
-            inline=False
-        )
-
-        # Add data persistence notice
-        embed.add_field(
-            name="💾 Data Persistence",
-            value="All thy records are safely preserved in the royal archives!",
+            value=f"**{cap_type} Cap**: {format_gold_amount(await get_gold_cap(member.id, ctx.guild.id))} gold pieces",
             inline=False
         )
 
@@ -1390,11 +1214,11 @@ async def backup_cmd(ctx):
     """Create a complete backup of all data (Admin only)"""
     try:
         # Create backup
-        backup_file = backup_all_data()
+        backup_file = await backup_all_data()
 
         if backup_file:
             # Export summary
-            summary = export_data_summary()
+            summary = await export_data_summary()
 
             embed = medieval_embed(
                 title="💾 Royal Archive Backup Complete",
@@ -1429,7 +1253,7 @@ async def backup_cmd(ctx):
 async def data_status_cmd(ctx):
     """Show comprehensive data persistence status"""
     try:
-        summary = export_data_summary()
+        summary = await export_data_summary()
 
         embed = medieval_embed(
             title="📊 Royal Data Archives Status",
@@ -1472,10 +1296,17 @@ async def data_status_cmd(ctx):
 @bot.command(name="adminbounty")
 @commands.guild_only()
 async def admin_bounty_cmd(ctx):
-    """Claim thy monthly administrator's bounty (30 billion gold)"""
+    """Claim thy monthly administrator's bounty (30 billion gold) - FIXED VERSION"""
     try:
-        success, amount, error = claim_admin_monthly_bonus(ctx.author.id, ctx.guild.id)
-
+        # Verify user has Administrator permission in Discord
+        if not ctx.author.guild_permissions.administrator:
+            return await ctx.send(embed=medieval_response(
+                "Thou must have Administrator permissions to claim this bounty!",
+                success=False
+            ))
+        
+        success, amount, error = await claim_admin_monthly_bonus(ctx.author.id, ctx.guild.id)
+        
         if success:
             embed = medieval_embed(
                 title="👑 Royal Administrator's Bounty",
@@ -1501,7 +1332,7 @@ async def admin_bounty_cmd(ctx):
                 color_name="orange"
             )
             await ctx.send(embed=embed)
-
+            
     except Exception as e:
         await ctx.send(embed=medieval_response(f"Zounds! The royal exchequer protesteth: {str(e)}", success=False))
 
@@ -1510,7 +1341,7 @@ async def admin_bounty_cmd(ctx):
 async def stipend_cmd(ctx):
     """Claim thy daily royal stipend"""
     try:
-        success, amount = claim_daily(ctx.author.id, ctx.guild.id)
+        success, amount = await claim_daily(ctx.author.id, ctx.guild.id)
 
         if success:
             embed = medieval_embed(
@@ -1546,7 +1377,7 @@ async def stipend_cmd(ctx):
 async def labour_cmd(ctx):
     """Perform honest labour for wages - now with 1-hour individual cooldown!"""
     try:
-        success, amount, remaining_seconds = work(ctx.author.id, ctx.guild.id)
+        success, amount, remaining_seconds = await work(ctx.author.id, ctx.guild.id)
 
         if success:
             embed = medieval_embed(
@@ -1603,7 +1434,7 @@ async def wager_cmd(ctx, amount: int, game: str = "dice"):
             ))
 
         # Check weekly gambling tries first
-        can_gamble, remaining_tries, used_tries = can_gamble_weekly(ctx.author.id, ctx.guild.id)
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(ctx.author.id, ctx.guild.id)
 
         if not can_gamble:
             embed = medieval_embed(
@@ -1624,7 +1455,7 @@ async def wager_cmd(ctx, amount: int, game: str = "dice"):
             await ctx.send(embed=embed)
             return
 
-        win, win_amount, tries_info = gamble(ctx.author.id, ctx.guild.id, amount, game)
+        win, win_amount, tries_info = await gamble(ctx.author.id, ctx.guild.id, amount, game)
 
         if win_amount == 0 and tries_info.startswith("Thou hast exhausted"):
             await ctx.send(embed=medieval_response(tries_info, success=False))
@@ -1694,7 +1525,7 @@ async def pay_cmd(ctx, member: discord.Member, amount: int):
                 success=False
             ))
 
-        success, error = transfer_gold(ctx.author.id, member.id, ctx.guild.id, amount)
+        success, error = await transfer_gold(ctx.author.id, member.id, ctx.guild.id, amount)
 
         if success:
             embed = medieval_embed(
@@ -1748,7 +1579,7 @@ async def chronicles_cmd(ctx, member: discord.Member = None):
     """View thy economic chronicles - now with wins/losses!"""
     try:
         member = member or ctx.author
-        stats = get_economy_stats(member.id, ctx.guild.id)
+        stats = await get_economy_stats(member.id, ctx.guild.id)
 
         if not stats:
             return await ctx.send(embed=medieval_response(
@@ -1760,7 +1591,7 @@ async def chronicles_cmd(ctx, member: discord.Member = None):
         medieval_title, hierarchy_text, highest_role = get_user_role_info(member)
 
         # Get weekly gambling status
-        can_gamble, remaining_tries, used_tries = can_gamble_weekly(member.id, ctx.guild.id)
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(member.id, ctx.guild.id)
 
         embed = medieval_embed(
             title=f"📊 Royal Chronicles of {member.display_name}",
@@ -1834,9 +1665,9 @@ async def chronicles_cmd(ctx, member: discord.Member = None):
 @bot.command(name="nobles")
 @commands.guild_only()
 async def nobles_cmd(ctx):
-    """View the realm's most wealthy nobles - NO VAULT"""
+    """View the realm's most wealthy nobles"""
     try:
-        leaders = get_leaderboard(ctx.guild.id, 10)
+        leaders = await get_leaderboard(ctx.guild.id, 10)
 
         if not leaders:
             return await ctx.send(embed=medieval_response(
@@ -1853,7 +1684,7 @@ async def nobles_cmd(ctx):
         for i, row in enumerate(leaders, 1):
             member = ctx.guild.get_member(row['user_id'])
             if member:
-                gold_amount = row['gold']  # NO VAULT
+                gold_amount = row['gold']
                 medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"#{i}"
 
                 # Get real role info
@@ -1888,7 +1719,7 @@ async def nobles_cmd(ctx):
 async def wares_cmd(ctx):
     """View the royal merchant's fine Discord roles"""
     try:
-        items = get_shop_items(ctx.guild.id)
+        items = await get_shop_items(ctx.guild.id)
 
         if not items:
             return await ctx.send(embed=medieval_response(
@@ -1943,7 +1774,7 @@ async def wares_cmd(ctx):
 async def purchase_cmd(ctx, *, item_name: str):
     """Purchase Discord role from the royal shop"""
     try:
-        items = get_shop_items(ctx.guild.id)
+        items = await get_shop_items(ctx.guild.id)
 
         # Find item by name (case insensitive)
         item_id = None
@@ -1988,7 +1819,7 @@ async def treasures_cmd(ctx, member: discord.Member = None):
     """View thy purchased Discord roles"""
     try:
         member = member or ctx.author
-        items = get_user_inventory(member.id, ctx.guild.id)
+        items = await get_user_inventory(member.id, ctx.guild.id)
 
         if not items:
             return await ctx.send(embed=medieval_response(
@@ -1998,7 +1829,7 @@ async def treasures_cmd(ctx, member: discord.Member = None):
 
         embed = medieval_embed(
             title=f"🎒 Discord Roles of {member.display_name}",
-            description="The Discord roles belonging to {member.display_name}:",
+            description=f"The Discord roles belonging to {member.display_name}:",
             color_name="blue"
         )
 
@@ -2036,7 +1867,7 @@ async def setagrole_cmd(ctx, role: discord.Role):
             GIVEAWAY_ROLES[guild_id].append(role.id)
 
         # Save to database
-        save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
+        await save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
 
         embed = medieval_embed(
             title="⚔️ Tournament Host Role Set",
@@ -2068,7 +1899,7 @@ async def removeagrole_cmd(ctx, role: discord.Role):
             GIVEAWAY_ROLES[guild_id].remove(role.id)
 
             # Save to database
-            save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
+            await save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
 
             embed = medieval_embed(
                 title="⚔️ Tournament Host Role Removed",
@@ -2093,7 +1924,7 @@ async def tournament_cmd(ctx, duration_minutes: int, winner_count: int, prize_am
     """Host a royal tournament with gold prizes"""
     try:
         # Check permission
-        if not has_giveaway_permission(ctx.author, ctx.guild.id):
+        if not await has_giveaway_permission(ctx.author, ctx.guild.id):
             return await ctx.send(embed=medieval_response(
                 "Thou lacketh permission to host tournaments! Seek the steward's blessing.",
                 success=False
@@ -2118,7 +1949,7 @@ async def tournament_cmd(ctx, duration_minutes: int, winner_count: int, prize_am
             ))
 
         # Check host has enough gold (optional - they pay for the prize)
-        host_gold, _, _, _, _, is_admin = get_user_balance(ctx.author.id, ctx.guild.id)
+        host_gold, _, _, _, _, is_admin = await get_user_balance(ctx.author.id, ctx.guild.id)
         total_prize = prize_amount * winner_count
 
         if host_gold < total_prize:
@@ -2171,14 +2002,14 @@ async def tournament_cmd(ctx, duration_minutes: int, winner_count: int, prize_am
         await message.add_reaction("⚔️")
 
         # Create giveaway in database
-        success = create_giveaway(
+        success = await create_giveaway(
             ctx.guild.id, ctx.channel.id, message.id, ctx.author.id,
             prize_name, prize_amount, end_time, winner_count
         )
 
         if success:
             # Deduct gold from host
-            update_user_balance(ctx.author.id, ctx.guild.id, -total_prize, f"Funded tournament: {prize_name}")
+            await update_user_balance(ctx.author.id, ctx.guild.id, -total_prize, f"Funded tournament: {prize_name}")
 
             # Schedule end
             bot.loop.create_task(end_tournament_later(message.id, duration_minutes * 60))
@@ -2194,11 +2025,11 @@ async def end_tournament_later(message_id, delay_seconds):
     await asyncio.sleep(delay_seconds)
 
     try:
-        with get_db_connection() as db:
-            giveaway = db.execute("""
+        async with get_db_connection() as conn:
+            giveaway = await conn.fetchrow("""
             SELECT * FROM active_giveaways
-            WHERE message_id=? AND status='active'
-            """, (message_id,)).fetchone()
+            WHERE message_id=$1 AND status='active'
+            """, message_id)
 
             if giveaway:
                 await end_tournament(giveaway['id'])
@@ -2209,7 +2040,7 @@ async def end_tournament_later(message_id, delay_seconds):
 async def end_tournament(giveaway_id):
     """End a tournament and announce winners"""
     try:
-        winners, giveaway = end_giveaway(giveaway_id)
+        winners, giveaway = await end_giveaway(giveaway_id)
 
         if not giveaway:
             return
@@ -2282,7 +2113,7 @@ async def end_tournament(giveaway_id):
 async def tournaments_cmd(ctx):
     """View active tournaments in the realm"""
     try:
-        active_tournaments = get_active_giveaways(ctx.guild.id)
+        active_tournaments = await get_active_giveaways(ctx.guild.id)
 
         if not active_tournaments:
             return await ctx.send(embed=medieval_response(
@@ -2300,7 +2131,7 @@ async def tournaments_cmd(ctx):
             host = ctx.guild.get_member(tournament['host_id'])
             channel = ctx.guild.get_channel(tournament['channel_id'])
 
-            end_time = dt.fromisoformat(tournament['end_time'])
+            end_time = tournament['end_time']
 
             embed.add_field(
                 name=f"🏆 {tournament['prize_name']}",
@@ -2321,21 +2152,58 @@ async def tournaments_cmd(ctx):
 @bot.command(name="addware")
 @commands.has_permissions(manage_roles=True)
 @commands.guild_only()
-async def addware_cmd(ctx, name: str, role: discord.Role, price: int, stock: int = -1, *, description: str):
-    """Add Discord role to the royal shop (Admin)"""
+async def addware_cmd(ctx, price: int, stock: int = -1, *, details: str):
+    """Add Discord role to the royal shop (Admin) - FIXED VERSION"""
     try:
+        # Parse details string (format: "Role Name @role description")
+        parts = details.split()
+        
+        # Find the role mention
+        role_mention = None
+        role_name_parts = []
+        description_parts = []
+        parsing_description = False
+        
+        for i, part in enumerate(parts):
+            if part.startswith('<@&') and part.endswith('>'):  # Role mention found
+                role_mention = part
+                parsing_description = True
+            elif not parsing_description:
+                role_name_parts.append(part)
+            else:
+                description_parts.append(part)
+        
+        if not role_mention:
+            return await ctx.send(embed=medieval_response(
+                "Thou must mention a Discord role! Format: `!addware <price> <stock> Role Name @role description`",
+                success=False
+            ))
+        
+        # Extract role ID from mention
+        role_id = int(role_mention.strip('<@&>'))
+        role = ctx.guild.get_role(role_id)
+        
+        if not role:
+            return await ctx.send(embed=medieval_response(
+                "The mentioned role doth not exist in this realm!",
+                success=False
+            ))
+        
+        role_name = ' '.join(role_name_parts) or role.name
+        description = ' '.join(description_parts) or f"A fine {role.name} role from the royal shop"
+        
         if price <= 0:
             return await ctx.send(embed=medieval_response(
                 "The price must be a positive sum, good master!",
                 success=False
             ))
-
-        success = add_shop_item(ctx.guild.id, name, description, price, role, stock, ctx.author.id)
-
+        
+        success = await add_shop_item(ctx.guild.id, role_name, description, price, role, stock, ctx.author.id)
+        
         if success:
             embed = medieval_embed(
                 title="🏪 Royal Ware Added",
-                description=f"{get_royal_proclamation()} **{name}** hath been added to His Majesty's royal shop!",
+                description=f"{get_royal_proclamation()} **{role_name}** hath been added to His Majesty's royal shop!",
                 color_name="green"
             )
             embed.add_field(name="💰 Price", value=f"{format_gold_amount(price)} gold pieces", inline=True)
@@ -2344,16 +2212,15 @@ async def addware_cmd(ctx, name: str, role: discord.Role, price: int, stock: int
             embed.add_field(name="📜 Description", value=description, inline=False)
             embed.add_field(
                 name="💡 Usage",
-                value=f"Subjects may acquire this role with `{PREFIX}purchase {name}`",
+                value=f"Subjects may acquire this role with `{PREFIX}purchase {role_name}`",
                 inline=False
             )
-
+            
             await ctx.send(embed=embed)
-            print(f"✅ Added Discord role '{name}' to royal shop in {ctx.guild.name}")
-
+            
         else:
             await ctx.send(embed=medieval_response("The addition failed most grievously!", success=False))
-
+            
     except Exception as e:
         await ctx.send(embed=medieval_response(f"Alack! The royal shopkeepers protest: {str(e)}", success=False))
 
@@ -2363,14 +2230,13 @@ async def addware_cmd(ctx, name: str, role: discord.Role, price: int, stock: int
 async def removeware_cmd(ctx, *, name: str):
     """Remove ware from the royal shop (Admin)"""
     try:
-        with get_db_connection() as db:
-            result = db.execute("""
+        async with get_db_connection() as conn:
+            result = await conn.execute("""
             DELETE FROM shop_items
-            WHERE guild_id=? AND name=?
-            """, (ctx.guild.id, name))
+            WHERE guild_id=$1 AND name=$2
+            """, ctx.guild.id, name)
 
-            if result.rowcount > 0:
-                db.commit()
+            if "DELETE 1" in result:
                 await ctx.send(embed=medieval_response(
                     f"**{name}** hath been removed from His Majesty's shop!",
                     success=True
@@ -2388,49 +2254,168 @@ async def removeware_cmd(ctx, *, name: str):
 @tree.command(name="purse", description="Inspect thy purse and treasury with wins/losses!")
 @app_commands.describe(member="Which subject to inspect (optional)")
 async def slash_purse(interaction: discord.Interaction, member: discord.Member = None):
-    """Slash command for purse inspection"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        # Create a mock context
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    """Slash command for purse inspection - FIXED VERSION"""
+    await interaction.response.defer(ephemeral=False)
     
-    await purse_cmd(ctx, member)
+    try:
+        member = member or interaction.user
+        gold, wins, losses, total_earned, total_spent, is_admin = await get_user_balance(member.id, interaction.guild.id)
+        
+        # Get real Discord role information
+        medieval_title, hierarchy_text, highest_role = get_user_role_info(member)
+        
+        # Get weekly gambling status
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(member.id, interaction.guild.id)
+        
+        embed = medieval_embed(
+            title=f"💰 Royal Purse of {member.display_name}",
+            description=f"{get_treasury_greeting()} As {medieval_title} of the realm, thy financial standing is thus:",
+            color_name="gold"
+        )
+        
+        embed.add_field(
+            name="🏷️ Coin in Purse",
+            value=f"**{format_gold_amount(gold)}** gold pieces",
+            inline=False
+        )
+        
+        # WINS/LOSSES TRACKING
+        total_games = wins + losses
+        if total_games > 0:
+            win_rate = (wins / total_games) * 100 if total_games > 0 else 0
+            embed.add_field(
+                name="🎲 Gaming Record",
+                value=f"**{wins}** victories | **{losses}** defeats\n**{win_rate:.1f}%** success rate",
+                inline=True
+            )
+        
+        # WEEKLY GAMBLING STATUS
+        embed.add_field(
+            name="🃏 Weekly Gambling",
+            value=f"**{remaining_tries}**/{WEEKLY_GAMBLING_TRIES} tries remaining this week",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📈 Lifetime Earnings",
+            value=f"**{format_gold_amount(total_earned)}** gold pieces",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="📉 Lifetime Expenditures",
+            value=f"**{format_gold_amount(total_spent)}** gold pieces",
+            inline=True
+        )
+        
+        embed.add_field(
+            name="⚔️ Discord Station",
+            value=f"**{highest_role.name if highest_role else 'Citizen'}** of the Realm",
+            inline=False
+        )
+        
+        # Show role hierarchy information
+        if hierarchy_text:
+            embed.add_field(
+                name="🏰 Role Hierarchy",
+                value=hierarchy_text,
+                inline=False
+            )
+        
+        # Show gold cap information
+        cap_type = "Administrator" if is_admin else "Subject"
+        embed.add_field(
+            name="🏰 Royal Treasury Limit",
+            value=f"**{cap_type} Cap**: {format_gold_amount(await get_gold_cap(member.id, interaction.guild.id))} gold pieces",
+            inline=False
+        )
+        
+        embed.set_thumbnail(url=TREASURY_SEAL_URL)
+        await interaction.followup.send(embed=embed)
+        
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! An error hath befallen the exchequer: {str(e)}", success=False))
 
 @tree.command(name="stipend", description="Claim thy daily royal stipend (3-7 gold)")
 async def slash_stipend(interaction: discord.Interaction):
     """Slash command for daily stipend"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await stipend_cmd(ctx)
+    try:
+        success, amount = await claim_daily(interaction.user.id, interaction.guild.id)
+
+        if success:
+            embed = medieval_embed(
+                title="👑 Royal Daily Stipend",
+                description=f"{get_royal_proclamation()} {get_daily_stipend_phrase()}",
+                color_name="green"
+            )
+            embed.add_field(
+                name="💰 Gold Received",
+                value=f"**{amount}** gold pieces from the royal coffers!",
+                inline=True
+            )
+            embed.set_image(url=COIN_GIF_URL)
+            await interaction.followup.send(embed=embed)
+        else:
+            embed = medieval_embed(
+                title="⏰ Stipend Already Claimed",
+                description="Forsooth! Thou hast already received thy daily stipend!",
+                color_name="orange"
+            )
+            embed.add_field(
+                name="🕐 Next Available",
+                value="Return anon when the sun hath completed its cycle!",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The exchequer hath failed: {str(e)}", success=False))
 
 @tree.command(name="labour", description="Perform honest labour for wages (8-15 gold, 1-hour cooldown)")
 async def slash_labour(interaction: discord.Interaction):
     """Slash command for labour"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await labour_cmd(ctx)
+    try:
+        success, amount, remaining_seconds = await work(interaction.user.id, interaction.guild.id)
+
+        if success:
+            embed = medieval_embed(
+                title="⚒️ Honest Labour",
+                description=f"{get_royal_proclamation()} {get_work_phrase()}",
+                color_name="green"
+            )
+            embed.add_field(
+                name="💰 Wages Earned",
+                value=f"**{amount}** gold pieces for thy toil!",
+                inline=True
+            )
+            embed.set_image(url=ROYAL_CREST)
+            await interaction.followup.send(embed=embed)
+        else:
+            # Show detailed cooldown information
+            remaining_time = format_time_remaining(remaining_seconds)
+            embed = medieval_embed(
+                title="⏰ Labour Cooldown",
+                description="Thou must rest ere working again, good master!",
+                color_name="orange"
+            )
+            embed.add_field(
+                name="🕐 Time Until Next Labour",
+                value=f"**{remaining_time}**",
+                inline=False
+            )
+            embed.add_field(
+                name="💡 Tip",
+                value="Each citizen hath their own labour schedule - return when rested!",
+                inline=False
+            )
+            await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The guild masters protest: {str(e)}", success=False))
 
 @tree.command(name="wager", description="Wager gold upon games of chance")
 @app_commands.describe(
@@ -2444,17 +2429,96 @@ async def slash_labour(interaction: discord.Interaction):
 ])
 async def slash_wager(interaction: discord.Interaction, amount: int, game: str = "dice"):
     """Slash command for gambling"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await wager_cmd(ctx, amount, game)
+    try:
+        valid_games = ["dice", "coin", "slots"]
+        if game not in valid_games:
+            return await interaction.followup.send(embed=medieval_response(
+                f"Valid games be these: {', '.join(valid_games)}",
+                success=False
+            ))
+
+        if amount <= 0:
+            return await interaction.followup.send(embed=medieval_response(
+                "Thou must wager a positive sum, good master!",
+                success=False
+            ))
+
+        # Check weekly gambling tries first
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(interaction.user.id, interaction.guild.id)
+
+        if not can_gamble:
+            embed = medieval_embed(
+                title="🃏 Weekly Gambling Limit Reached",
+                description=f"Forsooth! Thou hast exhausted thy weekly gambling allowance!",
+                color_name="red"
+            )
+            embed.add_field(
+                name="📊 Usage This Week",
+                value=f"**{used_tries}**/{WEEKLY_GAMBLING_TRIES} tries used",
+                inline=True
+            )
+            embed.add_field(
+                name="⏰ Resets",
+                value="Monday at midnight UTC",
+                inline=True
+            )
+            await interaction.followup.send(embed=embed)
+            return
+
+        win, win_amount, tries_info = await gamble(interaction.user.id, interaction.guild.id, amount, game)
+
+        if win_amount == 0 and tries_info.startswith("Thou hast exhausted"):
+            await interaction.followup.send(embed=medieval_response(tries_info, success=False))
+            return
+
+        if win:
+            embed = medieval_embed(
+                title=f"🎲 {game.title()} - Victory!",
+                description=f"{get_royal_proclamation()} {get_gamble_phrase()}",
+                color_name="green"
+            )
+            embed.add_field(
+                name="💰 Gold Won",
+                value=f"**{format_gold_amount(win_amount)}** gold pieces from the wager!",
+                inline=True
+            )
+            embed.add_field(
+                name="🎯 Net Profit",
+                value=f"**{format_gold_amount(win_amount - amount)}** gold pieces!",
+                inline=True
+            )
+            embed.set_image(url="https://media.giphy.com/media/3ohzdYrPBjW6cy2gla/giphy.gif")
+        else:
+            embed = medieval_embed(
+                title=f"🎲 {game.title()} - Defeat",
+                description="Fortune was not with thee this day, good master!",
+                color_name="red"
+            )
+            embed.add_field(
+                name="💰 Gold Lost",
+                value=f"**{format_gold_amount(amount)}** gold pieces to the house!",
+                inline=True
+            )
+            embed.add_field(
+                name="😔 Outcome",
+                value="Better luck next time, noble friend!",
+                inline=True
+            )
+
+        # Add weekly gambling status to embed
+        if tries_info:
+            embed.add_field(
+                name="🃏 Weekly Status",
+                value=tries_info.strip(),
+                inline=False
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The gaming tables protest: {str(e)}", success=False))
 
 @tree.command(name="pay", description="Pay gold to another subject")
 @app_commands.describe(
@@ -2463,140 +2527,448 @@ async def slash_wager(interaction: discord.Interaction, amount: int, game: str =
 )
 async def slash_pay(interaction: discord.Interaction, member: discord.Member, amount: int):
     """Slash command for paying"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await pay_cmd(ctx, member, amount)
+    try:
+        if amount <= 0:
+            return await interaction.followup.send(embed=medieval_response(
+                "Thy sum must be positive, good master!",
+                success=False
+            ))
+
+        if member.id == interaction.user.id:
+            return await interaction.followup.send(embed=medieval_response(
+                "Thou canst not pay thyself, good sir!",
+                success=False
+            ))
+
+        success, error = await transfer_gold(interaction.user.id, member.id, interaction.guild.id, amount)
+
+        if success:
+            embed = medieval_embed(
+                title="💰 Royal Payment",
+                description=f"{get_royal_proclamation()} A transaction hath been completed betwixt subjects!",
+                color_name="green"
+            )
+            embed.add_field(
+                name="🧑‍💼 Payer",
+                value=f"{interaction.user.mention} the Generous",
+                inline=True
+            )
+            embed.add_field(
+                name="👑 Recipient",
+                value=f"{member.mention} the Fortunate",
+                inline=True
+            )
+            embed.add_field(
+                name="💰 Payment",
+                value=f"**{format_gold_amount(amount)}** gold pieces transferred!",
+                inline=True
+            )
+
+            await interaction.followup.send(embed=embed)
+
+            # Try to DM the recipient
+            try:
+                dm_embed = medieval_embed(
+                    title="💰 Payment Received",
+                    description=f"Hail! Thou hast received coin from {interaction.user.display_name}!",
+                    color_name="green"
+                )
+                dm_embed.add_field(
+                    name="💰 Amount Received",
+                    value=f"**{format_gold_amount(amount)}** gold pieces!",
+                    inline=True
+                )
+                await member.send(embed=dm_embed)
+            except:
+                pass
+
+        else:
+            await interaction.followup.send(embed=medieval_response(error, success=False))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The transfer failed: {str(e)}", success=False))
 
 @tree.command(name="chronicles", description="View economic chronicles with wins/losses")
 @app_commands.describe(member="Which subject to inspect (optional)")
 async def slash_chronicles(interaction: discord.Interaction, member: discord.Member = None):
     """Slash command for chronicles"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await chronicles_cmd(ctx, member)
+    try:
+        member = member or interaction.user
+        stats = await get_economy_stats(member.id, interaction.guild.id)
+
+        if not stats:
+            return await interaction.followup.send(embed=medieval_response(
+                "No economic chronicles exist for this subject!",
+                success=False
+            ))
+
+        # Get real Discord role information
+        medieval_title, hierarchy_text, highest_role = get_user_role_info(member)
+
+        # Get weekly gambling status
+        can_gamble, remaining_tries, used_tries = await can_gamble_weekly(member.id, interaction.guild.id)
+
+        embed = medieval_embed(
+            title=f"📊 Royal Chronicles of {member.display_name}",
+            description=f"The exchequer's records concerning {member.display_name}, {medieval_title} of the realm:",
+            color_name="blue"
+        )
+
+        embed.add_field(
+            name="💰 Purse Holdings",
+            value=f"**{format_gold_amount(stats['gold'])}** gold pieces",
+            inline=False
+        )
+
+        # WINS/LOSSES TRACKING INSTEAD OF VAULT
+        total_games = stats['gamble_wins'] + stats['gamble_losses']
+        if total_games > 0:
+            win_rate = (stats['gamble_wins'] / total_games) * 100
+            embed.add_field(
+                name="🎲 Gaming Record",
+                value=f"**{stats['gamble_wins']}** victories | **{stats['gamble_losses']}** defeats\n**{win_rate:.1f}%** success rate",
+                inline=True
+            )
+
+        # WEEKLY GAMBLING STATUS
+        embed.add_field(
+            name="🃏 Weekly Gambling",
+            value=f"**{remaining_tries}**/{WEEKLY_GAMBLING_TRIES} tries remaining this week",
+            inline=True
+        )
+
+        embed.add_field(
+            name="📈 Lifetime Earnings",
+            value=f"**{format_gold_amount(stats['total_gold_earned'])}** gold pieces",
+            inline=True
+        )
+
+        embed.add_field(
+            name="📉 Lifetime Expenditures",
+            value=f"**{format_gold_amount(stats['total_gold_spent'])}** gold pieces",
+            inline=True
+        )
+
+        embed.add_field(
+            name="⚔️ Discord Station",
+            value=f"**{highest_role.name if highest_role else 'Citizen'}** of the Realm",
+            inline=False
+        )
+
+        # Show role hierarchy information
+        if hierarchy_text:
+            embed.add_field(
+                name="🏰 Role Hierarchy",
+                value=hierarchy_text,
+                inline=False
+            )
+
+        # Show admin status and cap information
+        if stats['is_admin']:
+            embed.add_field(
+                name="👑 Royal Administrator",
+                value="Thou art a trusted administrator of the realm!",
+                inline=False
+            )
+
+        embed.set_thumbnail(url=TREASURY_SEAL_URL)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The chronicles are lost: {str(e)}", success=False))
 
 @tree.command(name="nobles", description="View the realm's wealthiest nobles")
 async def slash_nobles(interaction: discord.Interaction):
     """Slash command for nobles"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await nobles_cmd(ctx)
+    try:
+        leaders = await get_leaderboard(interaction.guild.id, 10)
+
+        if not leaders:
+            return await interaction.followup.send(embed=medieval_response(
+                "No wealthy nobles grace our realm!",
+                success=True
+            ))
+
+        embed = medieval_embed(
+            title="🏆 Roll of the Realm's Wealthiest Nobles",
+            description="The exchequer's accounting of the realm's most prosperous subjects:",
+            color_name="gold"
+        )
+
+        for i, row in enumerate(leaders, 1):
+            member = interaction.guild.get_member(row['user_id'])
+            if member:
+                gold_amount = row['gold']
+                medal = ["🥇", "🥈", "🥉"][i-1] if i <= 3 else f"#{i}"
+
+                # Get real role info
+                highest_role = get_user_highest_role(member)
+                role_info = f" ({highest_role.name})" if highest_role else ""
+
+                # Show admin status
+                admin_status = " 👑" if row['is_admin'] else ""
+
+                # Add gaming stats
+                total_games = row['gamble_wins'] + row['gamble_losses']
+                if total_games > 0:
+                    win_rate = (row['gamble_wins'] / total_games) * 100
+                    gaming_stats = f"\n🎲 {row['gamble_wins']}W-{row['gamble_losses']}L ({win_rate:.1f}%)"
+                else:
+                    gaming_stats = ""
+
+                embed.add_field(
+                    name=f"{medal} {member.display_name}{role_info}{admin_status}",
+                    value=f"**{format_gold_amount(gold_amount)}** gold pieces{gaming_stats}",
+                    inline=False
+                )
+
+        embed.set_thumbnail(url=TREASURY_SEAL_URL)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The roll is incomplete: {str(e)}", success=False))
 
 @tree.command(name="wares", description="View Discord roles for purchase in the royal shop")
 async def slash_wares(interaction: discord.Interaction):
     """Slash command for wares"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await wares_cmd(ctx)
+    try:
+        items = await get_shop_items(interaction.guild.id)
+
+        if not items:
+            return await interaction.followup.send(embed=medieval_response(
+                "The royal shop stands empty! Command thy stewards to stock it with Discord roles.",
+                success=True
+            ))
+
+        embed = medieval_embed(
+            title="🏪 Royal Merchant's Fine Discord Roles",
+            description="Discord roles available for purchase in His Majesty's shop:",
+            color_name="purple"
+        )
+
+        for item in items:
+            stock_text = f"Stock: {item['stock']}" if item['stock'] > 0 else "Unlimited"
+
+            # Show role information
+            role_info = ""
+            if item['role_name']:
+                role_color = f" (Color: {item['role_color']})" if item['role_color'] else ""
+                role_info = f"\nGrants role: **{item['role_name']}**{role_color}"
+                if item['role_position'] > 0:
+                    role_info += f"\nRole Position: **{item['role_position']}**"
+
+            embed.add_field(
+                name=f"{item['name']} - {format_gold_amount(item['price'])} 🪙",
+                value=f"{item['description']}\n*{stock_text}*{role_info}",
+                inline=False
+            )
+
+        embed.add_field(
+            name="💡 How to Purchase",
+            value=f"Use `{PREFIX}purchase <role_name>` or `/purchase <role_name>` to acquire these fine Discord roles!",
+            inline=False
+        )
+
+        # Add weekly gambling info
+        embed.add_field(
+            name="🎲 Weekly Gambling",
+            value=f"Each citizen gets **{WEEKLY_GAMBLING_TRIES}** gambling tries per week (resets Monday UTC)",
+            inline=False
+        )
+
+        embed.set_thumbnail(url=TREASURY_SEAL_URL)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The shop is in disarray: {str(e)}", success=False))
 
 @tree.command(name="purchase", description="Purchase Discord role from the royal shop")
 @app_commands.describe(item_name="Name of the role to purchase")
 async def slash_purchase(interaction: discord.Interaction, item_name: str):
     """Slash command for purchase"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await purchase_cmd(ctx, item_name=item_name)
+    try:
+        items = await get_shop_items(interaction.guild.id)
+
+        # Find item by name (case insensitive)
+        item_id = None
+        for item in items:
+            if item['name'].lower() == item_name.lower():
+                item_id = item['id']
+                break
+
+        if not item_id:
+            return await interaction.followup.send(embed=medieval_response(
+                f"The ware '{item_name}' exists not in our royal shop!",
+                success=False
+            ))
+
+        success, item_name, role_mention = await buy_item(interaction.user.id, interaction.guild.id, item_id, interaction.guild)
+
+        if success:
+            embed = medieval_embed(
+                title="💰 Purchase Complete",
+                description=f"{get_royal_proclamation()} Thou hast purchased **{item_name}** from the royal treasury!",
+                color_name="green"
+            )
+
+            if role_mention:
+                embed.add_field(
+                    name="⚔️ Discord Role Conferred",
+                    value=f"By royal decree, thou art now {role_mention}!",
+                    inline=False
+                )
+                embed.set_thumbnail(url=CHEST_URL)
+
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(embed=medieval_response(item_name, success=False))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The purchase failed: {str(e)}", success=False))
 
 @tree.command(name="treasures", description="View thy purchased Discord roles")
 @app_commands.describe(member="Which subject to inspect (optional)")
 async def slash_treasures(interaction: discord.Interaction, member: discord.Member = None):
     """Slash command for treasures"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await treasures_cmd(ctx, member)
+    try:
+        member = member or interaction.user
+        items = await get_user_inventory(member.id, interaction.guild.id)
+
+        if not items:
+            return await interaction.followup.send(embed=medieval_response(
+                f"{member.display_name} owns no Discord roles!",
+                success=True
+            ))
+
+        embed = medieval_embed(
+            title=f"🎒 Discord Roles of {member.display_name}",
+            description=f"The Discord roles belonging to {member.display_name}:",
+            color_name="blue"
+        )
+
+        for item in items:
+            role_color_text = f" (Color: {item['role_color']})" if item['role_color'] else ""
+            role_position_text = f"\nPosition: **{item['role_position']}**" if item['role_position'] > 0 else ""
+
+            embed.add_field(
+                name=item['name'],
+                value=f"{item['description']}\nRole: **{item['role_name']}**{role_color_text}{role_position_text}\nAcquired: <t:{int(dt.fromisoformat(item['purchased_at']).timestamp())}:R>",
+                inline=False
+            )
+
+        embed.set_thumbnail(url=CHEST_URL)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The treasury records are amiss: {str(e)}", success=False))
 
 @tree.command(name="adminbounty", description="Claim thy monthly administrator's bounty (30 billion gold)")
 async def slash_adminbounty(interaction: discord.Interaction):
     """Slash command for admin bounty"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await admin_bounty_cmd(ctx)
+    try:
+        # Verify user has Administrator permission in Discord
+        if not interaction.user.guild_permissions.administrator:
+            return await interaction.followup.send(embed=medieval_response(
+                "Thou must have Administrator permissions to claim this bounty!",
+                success=False
+            ))
+        
+        success, amount, error = await claim_admin_monthly_bonus(interaction.user.id, interaction.guild.id)
+        
+        if success:
+            embed = medieval_embed(
+                title="👑 Royal Administrator's Bounty",
+                description=f"{get_royal_proclamation()} By royal decree, the administrator's monthly bounty is conferred!",
+                color_name="green"
+            )
+            embed.add_field(
+                name="💰 Bounty Received",
+                value=f"**{format_gold_amount(amount)}** gold pieces from the royal treasury!",
+                inline=True
+            )
+            embed.add_field(
+                name="📅 Next Available",
+                value="Return in one month's time for thy next bounty!",
+                inline=True
+            )
+            embed.set_image(url=COIN_GIF_URL)
+            await interaction.followup.send(embed=embed)
+        else:
+            embed = medieval_embed(
+                title="⏰ Bounty Unavailable",
+                description=error or "The royal bounty cannot be claimed at this time!",
+                color_name="orange"
+            )
+            await interaction.followup.send(embed=embed)
+            
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The royal exchequer protesteth: {str(e)}", success=False))
 
 @tree.command(name="datastatus", description="Show comprehensive data persistence status")
 async def slash_datastatus(interaction: discord.Interaction):
     """Slash command for data status"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await data_status_cmd(ctx)
+    try:
+        summary = await export_data_summary()
+
+        embed = medieval_embed(
+            title="📊 Royal Data Archives Status",
+            description="The complete accounting of His Majesty's persistent records:",
+            color_name="blue"
+        )
+
+        if summary:
+            for table, count in summary.items():
+                if table not in ['total_gold_circulation', 'active_users']:
+                    embed.add_field(
+                        name=f"📋 {table.replace('_', ' ').title()}",
+                        value=f"**{count}** records",
+                        inline=True
+                    )
+
+            embed.add_field(
+                name="💰 Total Gold in Circulation",
+                value=f"**{format_gold_amount(summary.get('total_gold_circulation', 0))}** gold pieces",
+                inline=False
+            )
+
+            embed.add_field(
+                name="👥 Active Citizens",
+                value=f"**{summary.get('active_users', 0)}** subjects registered",
+                inline=True
+            )
+
+        embed.add_field(
+            name="💾 Persistence Level",
+            value="**MAXIMUM** - All data permanently preserved",
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The record keepers are confounded: {str(e)}", success=False))
 
 @tree.command(name="charter", description="Display the complete royal charter of commands")
 async def slash_charter(interaction: discord.Interaction):
     """Slash command for charter"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
-    
-    await charter_cmd(ctx)
+    await interaction.response.defer(ephemeral=False)
+    await charter_cmd(await bot.get_context(interaction.message) if interaction.message else None)
 
 # ---------- SLASH ADMIN COMMANDS ----------
 @tree.command(name="setagrole", description="Set roles that can host tournaments (Admin)")
@@ -2604,34 +2976,72 @@ async def slash_charter(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_roles=True)
 async def slash_setagrole(interaction: discord.Interaction, role: discord.Role):
     """Slash command for setagrole"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await setagrole_cmd(ctx, role)
+    try:
+        guild_id = interaction.guild.id
+
+        # Initialize guild roles if not exists
+        if guild_id not in GIVEAWAY_ROLES:
+            GIVEAWAY_ROLES[guild_id] = []
+
+        # Add role if not already added
+        if role.id not in GIVEAWAY_ROLES[guild_id]:
+            GIVEAWAY_ROLES[guild_id].append(role.id)
+
+        # Save to database
+        await save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
+
+        embed = medieval_embed(
+            title="⚔️ Tournament Host Role Set",
+            description=f"{get_tournament_proclamation()} {role.mention} can now host royal tournaments!",
+            color_name="green"
+        )
+
+        embed.add_field(
+            name="💡 Current Host Roles",
+            value=f"Members with these roles may host tournaments:\n" +
+                  "\n".join([f"• {interaction.guild.get_role(rid).mention}" for rid in GIVEAWAY_ROLES[guild_id]]),
+            inline=False
+        )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The herald's decree failed: {str(e)}", success=False))
 
 @tree.command(name="removeagrole", description="Remove tournament host role (Admin)")
 @app_commands.describe(role="Role to remove from tournament hosts")
 @app_commands.default_permissions(manage_roles=True)
 async def slash_removeagrole(interaction: discord.Interaction, role: discord.Role):
     """Slash command for removeagrole"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await removeagrole_cmd(ctx, role)
+    try:
+        guild_id = interaction.guild.id
+
+        if guild_id in GIVEAWAY_ROLES and role.id in GIVEAWAY_ROLES[guild_id]:
+            GIVEAWAY_ROLES[guild_id].remove(role.id)
+
+            # Save to database
+            await save_giveaway_roles_to_db(guild_id, GIVEAWAY_ROLES[guild_id])
+
+            embed = medieval_embed(
+                title="⚔️ Tournament Host Role Removed",
+                description=f"{role.mention} can no longer host tournaments.",
+                color_name="orange"
+            )
+        else:
+            embed = medieval_embed(
+                title="⚔️ Role Not Found",
+                description=f"{role.mention} was not set as a tournament host.",
+                color_name="red"
+            )
+
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The removal failed: {str(e)}", success=False))
 
 @tree.command(name="tournament", description="Host a royal tournament with gold prizes")
 @app_commands.describe(
@@ -2642,32 +3052,148 @@ async def slash_removeagrole(interaction: discord.Interaction, role: discord.Rol
 )
 async def slash_tournament(interaction: discord.Interaction, duration_minutes: int, winner_count: int, prize_amount: int, prize_name: str):
     """Slash command for tournament"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await tournament_cmd(ctx, duration_minutes, winner_count, prize_amount, prize_name)
+    try:
+        # Check permission
+        if not await has_giveaway_permission(interaction.user, interaction.guild.id):
+            return await interaction.followup.send(embed=medieval_response(
+                "Thou lacketh permission to host tournaments! Seek the steward's blessing.",
+                success=False
+            ))
+
+        if duration_minutes < 5 or duration_minutes > 1440:  # 5 min to 24 hours
+            return await interaction.followup.send(embed=medieval_response(
+                "Tournaments must last between 5 minutes and 24 hours!",
+                success=False
+            ))
+
+        if winner_count < 1 or winner_count > 10:
+            return await interaction.followup.send(embed=medieval_response(
+                "A tournament must have 1-10 winners!",
+                success=False
+            ))
+
+        if prize_amount < 1:
+            return await interaction.followup.send(embed=medieval_response(
+                "The prize must be at least 1 gold piece!",
+                success=False
+            ))
+
+        # Check host has enough gold (optional - they pay for the prize)
+        host_gold, _, _, _, _, is_admin = await get_user_balance(interaction.user.id, interaction.guild.id)
+        total_prize = prize_amount * winner_count
+
+        if host_gold < total_prize:
+            return await interaction.followup.send(embed=medieval_response(
+                f"Thou needst {format_gold_amount(total_prize)} gold to fund this tournament! Thy purse contains only {format_gold_amount(host_gold)}.",
+                success=False
+            ))
+
+        end_time = utcnow() + timedelta(minutes=duration_minutes)
+
+        embed = medieval_embed(
+            title=f"⚔️ Royal Tournament: {prize_name}",
+            description=f"{get_tournament_proclamation()} {get_tournament_phrase()}",
+            color_name="gold"
+        )
+
+        embed.add_field(
+            name="🏆 Prize",
+            value=f"**{format_gold_amount(prize_amount)}** gold pieces each",
+            inline=True
+        )
+
+        embed.add_field(
+            name="👑 Winners",
+            value=f"**{winner_count}** champion(s) will be crowned",
+            inline=True
+        )
+
+        embed.add_field(
+            name="⏰ Duration",
+            value=f"Ends <t:{int(end_time.timestamp())}:R>",
+            inline=True
+        )
+
+        embed.add_field(
+            name="🎭 Tournament Host",
+            value=f"{interaction.user.mention} the Generous",
+            inline=False
+        )
+
+        embed.add_field(
+            name="💡 How to Enter",
+            value="React with ⚔️ to join the tournament!",
+            inline=False
+        )
+
+        embed.set_thumbnail(url=TOURNAMENT_URL)
+
+        message = await interaction.channel.send(embed=embed)
+        await message.add_reaction("⚔️")
+
+        # Create giveaway in database
+        success = await create_giveaway(
+            interaction.guild.id, interaction.channel.id, message.id, interaction.user.id,
+            prize_name, prize_amount, end_time, winner_count
+        )
+
+        if success:
+            # Deduct gold from host
+            await update_user_balance(interaction.user.id, interaction.guild.id, -total_prize, f"Funded tournament: {prize_name}")
+
+            # Schedule end
+            bot.loop.create_task(end_tournament_later(message.id, duration_minutes * 60))
+            await interaction.followup.send("✅ Tournament created successfully!")
+
+        else:
+            await interaction.followup.send(embed=medieval_response("The tournament creation failed!", success=False))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The herald's trumpet failed: {str(e)}", success=False))
 
 @tree.command(name="tournaments", description="View active tournaments in the realm")
 async def slash_tournaments(interaction: discord.Interaction):
     """Slash command for tournaments"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await tournaments_cmd(ctx)
+    try:
+        active_tournaments = await get_active_giveaways(interaction.guild.id)
+
+        if not active_tournaments:
+            return await interaction.followup.send(embed=medieval_response(
+                "No tournaments are currently proclaimed in the realm!",
+                success=True
+            ))
+
+        embed = medieval_embed(
+            title="⚔️ Active Royal Tournaments",
+            description="These tournaments await brave champions:",
+            color_name="blue"
+        )
+
+        for tournament in active_tournaments:
+            host = interaction.guild.get_member(tournament['host_id'])
+            channel = interaction.guild.get_channel(tournament['channel_id'])
+
+            end_time = tournament['end_time']
+
+            embed.add_field(
+                name=f"🏆 {tournament['prize_name']}",
+                value=f"Host: {host.mention if host else 'Unknown'}\n"
+                      f"Prize: **{format_gold_amount(tournament['prize_amount'])}** gold each\n"
+                      f"Winners: **{tournament['winner_count']}**\n"
+                      f"Ends: <t:{int(end_time.timestamp())}:R>\n"
+                      f"Location: {channel.mention if channel else 'Unknown'}",
+                inline=False
+            )
+
+        embed.set_thumbnail(url=TOURNAMENT_URL)
+        await interaction.followup.send(embed=embed)
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The tournament ledger is amiss: {str(e)}", success=False))
 
 @tree.command(name="addware", description="Add Discord role to the royal shop (Admin)")
 @app_commands.describe(
@@ -2680,50 +3206,110 @@ async def slash_tournaments(interaction: discord.Interaction):
 @app_commands.default_permissions(manage_roles=True)
 async def slash_addware(interaction: discord.Interaction, name: str, role: discord.Role, price: int, stock: int = -1, description: str = "A fine Discord role from the royal shop"):
     """Slash command for addware"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await addware_cmd(ctx, name, role, price, stock, description)
+    try:
+        if price <= 0:
+            return await interaction.followup.send(embed=medieval_response(
+                "The price must be a positive sum, good master!",
+                success=False
+            ))
+
+        success = await add_shop_item(interaction.guild.id, name, description, price, role, stock, interaction.user.id)
+
+        if success:
+            embed = medieval_embed(
+                title="🏪 Royal Ware Added",
+                description=f"{get_royal_proclamation()} **{name}** hath been added to His Majesty's royal shop!",
+                color_name="green"
+            )
+            embed.add_field(name="💰 Price", value=f"{format_gold_amount(price)} gold pieces", inline=True)
+            embed.add_field(name="⚔️ Role Conferred", value=role.mention, inline=True)
+            embed.add_field(name="📦 Stock", value=f"{stock if stock > 0 else 'Unlimited'}", inline=True)
+            embed.add_field(name="📜 Description", value=description, inline=False)
+            embed.add_field(
+                name="💡 Usage",
+                value=f"Subjects may acquire this role with `{PREFIX}purchase {name}`",
+                inline=False
+            )
+
+            await interaction.followup.send(embed=embed)
+
+        else:
+            await interaction.followup.send(embed=medieval_response("The addition failed most grievously!", success=False))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The royal shopkeepers protest: {str(e)}", success=False))
 
 @tree.command(name="removeware", description="Remove ware from the royal shop (Admin)")
 @app_commands.describe(name="Name of the ware to remove")
 @app_commands.default_permissions(manage_roles=True)
 async def slash_removeware(interaction: discord.Interaction, name: str):
     """Slash command for removeware"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await removeware_cmd(ctx, name=name)
+    try:
+        async with get_db_connection() as conn:
+            result = await conn.execute("""
+            DELETE FROM shop_items
+            WHERE guild_id=$1 AND name=$2
+            """, interaction.guild.id, name)
+
+            if "DELETE 1" in result:
+                await interaction.followup.send(embed=medieval_response(
+                    f"**{name}** hath been removed from His Majesty's shop!",
+                    success=True
+                ))
+            else:
+                await interaction.followup.send(embed=medieval_response(
+                    f"The ware '{name}' exists not in our royal inventory!",
+                    success=False
+                ))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Zounds! The removal failed: {str(e)}", success=False))
 
 @tree.command(name="backup", description="Create a complete backup of all data (Admin)")
 @app_commands.default_permissions(administrator=True)
 async def slash_backup(interaction: discord.Interaction):
     """Slash command for backup"""
-    await interaction.response.defer()
-    ctx = await bot.get_context(interaction.message) if interaction.message else None
-    if not ctx:
-        class MockContext:
-            def __init__(self, interaction):
-                self.author = interaction.user
-                self.guild = interaction.guild
-                self.send = interaction.followup.send
-        ctx = MockContext(interaction)
+    await interaction.response.defer(ephemeral=False)
     
-    await backup_cmd(ctx)
+    try:
+        # Create backup
+        backup_file = await backup_all_data()
+
+        if backup_file:
+            # Export summary
+            summary = await export_data_summary()
+
+            embed = medieval_embed(
+                title="💾 Royal Archive Backup Complete",
+                description=f"{get_royal_proclamation()} The royal archives have been preserved for posterity!",
+                color_name="green"
+            )
+
+            embed.add_field(
+                name="📁 Backup File",
+                value=f"`{backup_file}`",
+                inline=False
+            )
+
+            if summary:
+                embed.add_field(
+                    name="📊 Data Summary",
+                    value=f"Active Users: **{summary.get('active_users', 0)}**\n"
+                          f"Total Gold: **{format_gold_amount(summary.get('total_gold_circulation', 0))}**\n"
+                          f"Config Entries: **{summary.get('persistent_config', 0)}**",
+                    inline=True
+                )
+
+            await interaction.followup.send(embed=embed)
+        else:
+            await interaction.followup.send(embed=medieval_response("The backup failed most grievously!", success=False))
+
+    except Exception as e:
+        await interaction.followup.send(embed=medieval_response(f"Alack! The backup scribes protest: {str(e)}", success=False))
 
 # ---------- REACTION HANDLER FOR TOURNAMENTS ----------
 @bot.event
@@ -2734,14 +3320,14 @@ async def on_reaction_add(reaction, user):
 
     if reaction.emoji == "⚔️":
         try:
-            with get_db_connection() as db:
-                giveaway = db.execute("""
+            async with get_db_connection() as conn:
+                giveaway = await conn.fetchrow("""
                 SELECT * FROM active_giveaways
-                WHERE message_id=? AND status='active'
-                """, (reaction.message.id,)).fetchone()
+                WHERE message_id=$1 AND status='active'
+                """, reaction.message.id)
 
                 if giveaway:
-                    success, message = enter_giveaway(giveaway['id'], user.id)
+                    success, message = await enter_giveaway(giveaway['id'], user.id)
                     if success:
                         try:
                             embed = medieval_embed(
@@ -2826,7 +3412,7 @@ async def charter_cmd(ctx):
                   "• **Weekly Gambling**: 30 tries per week (resets Monday UTC)\n"
                   "• **NO Vault System**: All gold kept in purse for simplicity\n"
                   "• **Real Discord Roles**: Purchase actual Discord roles with gold\n"
-                  "• **Complete Data Persistence**: Everything saved to database\n"
+                  "• **Complete Data Persistence**: Everything saved to PostgreSQL database\n"
                   "• **Dual Command System**: Use both prefix (`!`) and slash (`/`) commands!",
             inline=False
         )
@@ -2891,7 +3477,7 @@ async def charter_cmd(ctx):
             value="• **Gold Caps**: Administrators have higher treasury limits\n"
                   "• **Admin Bounty**: Monthly 30 billion gold bonus for administrators\n"
                   "• **Wealth Limits**: Normal subjects capped at 50 billion gold\n"
-                  "• **Complete Persistence**: All data saved to database\n"
+                  "• **Complete Persistence**: All data saved to PostgreSQL database\n"
                   "• **Full Compatibility**: All commands work with both systems!",
             inline=False
         )
@@ -2927,7 +3513,7 @@ async def charter_cmd(ctx):
                   "• Tournaments require gold funding from the host\n"
                   "• Winners are chosen randomly from entrants\n"
                   "• React with ⚔️ to enter any tournament\n"
-                  "• All data persistently saved to database\n"
+                  "• All data persistently saved to PostgreSQL database\n"
                   "• Use either prefix or slash commands!",
             inline=False
         )
@@ -2983,7 +3569,7 @@ async def charter_cmd(ctx):
                   "• Work hourly for steady wages (8-15 gold)\n"
                   "• Administrators claim monthly 30 billion bonus\n"
                   "• Purchase Discord roles for prestige and status\n"
-                  "• All progress saved permanently to database\n"
+                  "• All progress saved permanently to PostgreSQL database\n"
                   "• Use `!` or `/` commands - thy choice!",
             inline=False
         )
@@ -3029,6 +3615,7 @@ async def charter_cmd(ctx):
                   "• Administrator privileges grant significant advantages\n"
                   "• Complete data persistence ensures nothing is ever lost\n"
                   "• **DUAL COMMAND SYSTEM**: Prefix (`{PREFIX}`) AND Slash (`/`) commands work!\n"
+                  "• **POSTGRESQL DATABASE**: All data permanently stored in PostgreSQL\n"
                   "• May fortune favor thee in His Majesty's eternal realm!",
             inline=False
         )
@@ -3061,6 +3648,186 @@ async def ehelp_cmd(ctx):
     """Display economy help (medieval charter)"""
     await charter_cmd(ctx)
 
+# ---------- COMPREHENSIVE DATABASE INITIALIZATION ----------
+async def init_db():
+    """Initialize COMPREHENSIVE persistent database with ALL data - PostgreSQL"""
+    try:
+        print("🏰 Initializing COMPREHENSIVE PERSISTENT PostgreSQL database...")
+        
+        async with get_db_connection() as conn:
+            # Create all tables
+            tables_to_create = {
+                'persistent_config': """
+                    CREATE TABLE IF NOT EXISTS persistent_config (
+                        config_key TEXT PRIMARY KEY,
+                        config_value TEXT,
+                        updated_at TIMESTAMP,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """,
+                
+                'user_economy': """
+                    CREATE TABLE IF NOT EXISTS user_economy (
+                        user_id BIGINT NOT NULL,
+                        guild_id BIGINT NOT NULL,
+                        gold BIGINT DEFAULT 100,
+                        daily_claimed TIMESTAMP,
+                        work_cooldown TIMESTAMP,
+                        gamble_wins INTEGER DEFAULT 0,
+                        gamble_losses INTEGER DEFAULT 0,
+                        total_gold_earned BIGINT DEFAULT 100,
+                        total_gold_spent BIGINT DEFAULT 0,
+                        noble_title TEXT DEFAULT 'Discord Citizen',
+                        is_admin BOOLEAN DEFAULT false,
+                        admin_monthly_claimed TIMESTAMP,
+                        PRIMARY KEY (user_id, guild_id)
+                    )
+                """,
+                
+                'transactions': """
+                    CREATE TABLE IF NOT EXISTS transactions (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        guild_id BIGINT,
+                        type TEXT,
+                        amount BIGINT,
+                        description TEXT,
+                        timestamp TIMESTAMP,
+                        balance_after BIGINT
+                    )
+                """,
+                
+                'shop_items': """
+                    CREATE TABLE IF NOT EXISTS shop_items (
+                        id SERIAL PRIMARY KEY,
+                        guild_id BIGINT,
+                        name TEXT,
+                        description TEXT,
+                        price BIGINT,
+                        role_id BIGINT,
+                        role_name TEXT,
+                        role_color TEXT,
+                        role_position INTEGER,
+                        stock INTEGER DEFAULT -1,
+                        created_by BIGINT,
+                        created_at TIMESTAMP
+                    )
+                """,
+                
+                'user_inventory': """
+                    CREATE TABLE IF NOT EXISTS user_inventory (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        guild_id BIGINT,
+                        item_id INTEGER,
+                        quantity INTEGER DEFAULT 1,
+                        purchased_at TIMESTAMP
+                    )
+                """,
+                
+                'gambling_records': """
+                    CREATE TABLE IF NOT EXISTS gambling_records (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        guild_id BIGINT,
+                        game_type TEXT,
+                        bet_amount BIGINT,
+                        win_amount BIGINT,
+                        outcome TEXT,
+                        timestamp TIMESTAMP
+                    )
+                """,
+                
+                'active_giveaways': """
+                    CREATE TABLE IF NOT EXISTS active_giveaways (
+                        id SERIAL PRIMARY KEY,
+                        guild_id BIGINT,
+                        channel_id BIGINT,
+                        message_id BIGINT,
+                        host_id BIGINT,
+                        prize_name TEXT,
+                        prize_amount BIGINT,
+                        end_time TIMESTAMP,
+                        winner_count INTEGER,
+                        requirements TEXT,
+                        status TEXT DEFAULT 'active'
+                    )
+                """,
+                
+                'giveaway_entries': """
+                    CREATE TABLE IF NOT EXISTS giveaway_entries (
+                        id SERIAL PRIMARY KEY,
+                        giveaway_id INTEGER,
+                        user_id BIGINT,
+                        entered_at TIMESTAMP
+                    )
+                """,
+                
+                'admin_monthly_claims': """
+                    CREATE TABLE IF NOT EXISTS admin_monthly_claims (
+                        id SERIAL PRIMARY KEY,
+                        user_id BIGINT,
+                        guild_id BIGINT,
+                        claim_month TEXT,
+                        claimed_at TIMESTAMP,
+                        amount BIGINT
+                    )
+                """
+            }
+            
+            # Create all tables
+            for table_name, create_sql in tables_to_create.items():
+                print(f"🗡️ Creating {table_name} table...")
+                try:
+                    await conn.execute(create_sql)
+                except Exception as table_error:
+                    print(f"⚠️ Warning creating {table_name}: {table_error}")
+            
+            # Create indexes for better performance
+            indexes = [
+                "CREATE INDEX IF NOT EXISTS idx_user_economy_guild ON user_economy(guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_transactions_user ON transactions(user_id, guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_gambling_records_user ON gambling_records(user_id, guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_gambling_records_timestamp ON gambling_records(timestamp)",
+                "CREATE INDEX IF NOT EXISTS idx_shop_items_guild ON shop_items(guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_user_inventory_user ON user_inventory(user_id, guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_giveaway_entries_giveaway ON giveaway_entries(giveaway_id)",
+                "CREATE INDEX IF NOT EXISTS idx_active_giveaways_guild ON active_giveaways(guild_id)",
+                "CREATE INDEX IF NOT EXISTS idx_persistent_config_key ON persistent_config(config_key)"
+            ]
+            
+            for index_sql in indexes:
+                try:
+                    await conn.execute(index_sql)
+                except Exception as index_error:
+                    print(f"⚠️ Warning creating index: {index_error}")
+            
+            print("✅ COMPREHENSIVE PERSISTENT PostgreSQL Database created with ALL features!")
+            
+    except Exception as e:
+        print(f"❌ Database initialization error: {e}")
+        traceback.print_exc()
+        raise
+
+async def load_all_saved_config():
+    """Load all saved configuration from database"""
+    try:
+        # Load giveaway roles
+        async with get_db_connection() as conn:
+            rows = await conn.fetch("""
+            SELECT config_key, config_value FROM persistent_config
+            WHERE config_key LIKE 'giveaway_roles_%'
+            """)
+
+            for row in rows:
+                guild_id = int(row['config_key'].replace('giveaway_roles_', ''))
+                role_ids = json.loads(row['config_value'])
+                GIVEAWAY_ROLES[guild_id] = role_ids
+
+        print(f"✅ Loaded {len(GIVEAWAY_ROLES)} guilds' giveaway roles from database")
+    except Exception as e:
+        print(f"❌ Error loading saved config: {e}")
+
 # ---------- ON READY ----------
 @bot.event
 async def on_ready():
@@ -3073,6 +3840,11 @@ async def on_ready():
         print('📜 Complete charter of commands loaded!')
         print('💰 Authentic Middle English language engaged!')
         print('👑 Bot ready for COMPLETE PERSISTENCE!')
+        
+        # Initialize PostgreSQL database
+        await create_db_pool()
+        await init_db()
+        
         print('🏆 Tournament hosting system ready!')
         print('💎 Gold caps system activated!')
         print('👑 Admin monthly bounty system ready!')
@@ -3083,10 +3855,14 @@ async def on_ready():
         print('💾 MAXIMUM DATA PERSISTENCE ACTIVATED!')
         print('🎯 ULTIMATE MERGED VERSION READY!')
         print('🔄 DUAL COMMAND SYSTEM: BOTH PREFIX AND SLASH COMMANDS WORK!')
+        print('🗄️ POSTGRESQL DATABASE CONNECTED!')
 
         # Create initial backup
-        backup_all_data()
-        export_data_summary()
+        await backup_all_data()
+        await export_data_summary()
+
+        # Load saved configuration
+        await load_all_saved_config()
 
         # Sync slash commands
         try:
@@ -3097,6 +3873,7 @@ async def on_ready():
 
     except Exception as e:
         print(f"Error in on_ready: {e}")
+        traceback.print_exc()
 
 # ---------- AUTHENTIC MEDIEVAL ERROR HANDLER ----------
 @bot.event
@@ -3122,6 +3899,7 @@ async def on_command_error(ctx, error):
         ))
     else:
         print(f"Command error: {error}")
+        traceback.print_exc()
         await ctx.send(embed=medieval_response(
             "An ill omen hath befallen the royal clerks!",
             success=False
@@ -3139,7 +3917,6 @@ def run_flask():
 
 if __name__ == "__main__":
     try:
-        init_db()
         print("🏰 Initializing ULTIMATE MERGED Medieval Economy Bot...")
         print("⚔️ COMPLETE Royal exchequer established!")
         print("🎲 Gaming tables prepared!")
@@ -3158,6 +3935,7 @@ if __name__ == "__main__":
         print("💾 MAXIMUM DATA PERSISTENCE ACHIEVED!")
         print("🎯 ALL SYSTEMS PERSISTENT - ULTIMATE MERGED VERSION!")
         print("🔄 DUAL COMMAND SYSTEM: PREFIX AND SLASH COMMANDS BOTH WORK!")
+        print("🗄️ POSTGRESQL DATABASE SUPPORT ENABLED!")
 
         # Start Flask keep-alive server in background thread
         Thread(target=run_flask, daemon=True).start()
